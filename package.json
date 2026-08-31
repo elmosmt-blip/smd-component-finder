@@ -1,0 +1,27 @@
+{
+  "name": "smd-component-finder",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Identify SMD components by marking, part number or OCR — plus a local RAG search over your own datasheet PDFs",
+  "scripts": {
+    "test": "node tools/test-matcher.js && node tools/test-ui.js",
+    "test:matcher": "node tools/test-matcher.js",
+    "test:ui": "node tools/test-ui.js",
+    "import": "node tools/import_dataset.mjs",
+    "serve": "python3 -m http.server 8000",
+    "serve:rag": "python3 tools/rag/serve.py --port 8000",
+    "test:rag": "python3 tools/test_rag.py"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  },
+  "keywords": [
+    "smd",
+    "marking",
+    "identification",
+    "ocr",
+    "electronics",
+    "repair"
+  ],
+  "license": "MIT"
+}

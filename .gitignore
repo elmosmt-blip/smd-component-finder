@@ -1,0 +1,13 @@
+node_modules/
+npm-debug.log*
+.DS_Store
+
+# результат импорта своей базы (генерируется tools/import_dataset.mjs)
+data/extra-parts.json
+
+# индекс RAG: генерируется tools/rag/pipeline.py из data/datasheets
+data/rag/
+
+__pycache__/
+*.pyc
+.venv/

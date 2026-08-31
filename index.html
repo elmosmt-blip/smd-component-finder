@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMD Component Finder — marking lookup + datasheet RAG</title>
+<meta name="description" content="Identify SMD components by top marking, part number or camera OCR, and search your own datasheet PDF library. Everything runs locally in the browser.">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<a class="skip" href="#main-content">Skip to main content</a>
+
+<header class="topbar">
+  <div class="wrap">
+    <div class="crumbs"><span class="badge">Engineer Tool</span> <a class="back" href="#main-content">Two engines: marking lookup + datasheet RAG</a></div>
+    <h1>SMD Component Finder</h1>
+    <p class="lede">Search SMD markings, part numbers and OCR captures — then confirm the answer
+       against your own datasheet PDFs. Marking search is fuzzy and offline; datasheet search
+       runs over a local RAG index of your PDF library.</p>
+
+    <div class="specs">
+      <div class="spec"><span class="spec-k">Input</span><span class="spec-v">Marking, part number, OCR or question</span></div>
+      <div class="spec"><span class="spec-k">Best For</span><span class="spec-v">Fast package identification and rating checks</span></div>
+      <div class="spec"><span class="spec-k">Output</span><span class="spec-v">Ranked candidates + datasheet evidence</span></div>
+      <div class="spec"><span class="spec-k">Workflow</span><span class="spec-v">Identify → filter → compare → verify</span></div>
+    </div>
+
+    <ol class="workflow">
+      <li>Enter a top mark, part number or OCR result.</li>
+      <li>Narrow candidates by package family.</li>
+      <li>Compare confidence, package, manufacturer and datasheet evidence.</li>
+      <li>Verify pinout and ratings in the datasheet before replacing.</li>
+    </ol>
+  </div>
+</header>
+
+<main id="main-content" class="wrap">
+
+  <!-- ============================ MARKING SEARCH ============================ -->
+  <section class="panel">
+    <h2 class="panel-title">1 · Identify by marking</h2>
+
+    <div class="search-row">
+      <input id="q" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Marking, part number or OCR: 1A, A7, 78M05, SI2301…">
+      <button id="btnSearch" class="btn btn-primary">Search</button>
+      <button id="btnCamera" class="btn">Camera / OCR</button>
+    </div>
+
+    <div class="row">
+      <span class="row-label">Examples:</span>
+      <div id="examples" class="chips"></div>
+    </div>
+
+    <div class="row">
+      <span class="row-label">Package:</span>
+      <select id="pkgSelect" class="select"></select>
+    </div>
+
+    <div class="row">
+      <div id="pkgChips" class="chips"></div>
+      <div id="pkgMeta" class="pkg-meta"></div>
+    </div>
+
+    <div class="row opts">
+      <label class="switch"><input type="checkbox" id="optOnline" checked> <span>Online Search</span></label>
+      <label class="switch"><input type="checkbox" id="optAutoPdf"> <span>Open PDF Immediately</span></label>
+      <span class="hint">Leave “Open PDF Immediately” off while comparing candidates — browsers
+        may block automatic PDF tabs.</span>
+    </div>
+
+    <div id="history" class="history"></div>
+  </section>
+
+  <!-- ============================ OCR ============================ -->
+  <section id="ocrPanel" class="panel ocr">
+    <div class="ocr-layout">
+      <div class="ocr-left">
+        <div id="stage" class="stage">
+          <video id="video" playsinline muted style="display:none"></video>
+          <div id="cropBox" class="crop-box">
+            <span class="crop-hint">Drag the cyan box over the marking</span>
+            <i class="handle" data-handle="se"></i>
+          </div>
+          <div class="stage-empty" id="stageEmpty">Point the camera at the component marking</div>
+        </div>
+        <div id="ocrStatus" class="ocr-status">Camera is off</div>
+
+        <div class="ocr-controls">
+          <button id="btnStartCam" class="btn">Start Camera</button>
+          <button id="btnCapture" class="btn">Capture Image</button>
+          <button id="btnAnalyze" class="btn btn-primary" disabled>Analyze Current Crop</button>
+          <button id="btnSwitch" class="btn">Switch Camera</button>
+          <button id="btnUpload" class="btn">Upload File</button>
+          <input id="fileInput" type="file" accept="image/*" hidden>
+        </div>
+
+        <div class="ocr-opts">
+          <div class="opt-group">
+            <span class="row-label">Cropping:</span>
+            <label class="radio"><input type="radio" name="cropMode" value="auto" checked> Auto Crop Marking</label>
+            <label class="radio"><input type="radio" name="cropMode" value="center"> Center Crop</label>
+            <label class="radio"><input type="radio" name="cropMode" value="full"> Use Full Image</label>
+          </div>
+          <div class="opt-group">
+            <span class="row-label">Mark size:</span>
+            <button class="chip" data-preset="small">Small Mark</button>
+            <button class="chip chip-on" data-preset="wide">Wide IC Mark</button>
+            <button class="chip" data-preset="large">Large Package</button>
+          </div>
+        </div>
+        <div class="hint">Laser marking on black epoxy is <b>light text on a dark background</b> —
+          the engine tries inverted binarisation automatically. Side lighting and sharpness matter
+          far more than resolution.</div>
+      </div>
+
+      <div class="ocr-right">
+        <div id="ocrResults" class="ocr-results"></div>
+        <div class="ocr-tips">
+          <b>How to get a readable frame</b>
+          <ul>
+            <li>Light the body from the side: a flash straight into the lens kills contrast.</li>
+            <li>Move in to 3–8 cm and use macro mode or digital zoom.</li>
+            <li>Crop so the marking fills at least 60 % of the box width.</li>
+            <li>If the code stays unreadable, type it in — 2–3 characters are often enough.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ RESULTS ============================ -->
+  <section class="results-layout">
+    <div class="col-left">
+      <div class="col-head">
+        <h2>Candidates</h2>
+        <span id="resultsCount" class="muted"></span>
+      </div>
+      <div id="strategy" class="strategy"></div>
+      <div id="results" class="results"></div>
+
+      <div id="empty" class="empty hidden">
+        <div class="empty-icon">!</div>
+        <div class="empty-title">No results found</div>
+        <p class="muted">Try a different query or check the marking.</p>
+        <ul class="empty-tips">
+          <li>Drop the suffix — date/lot codes break exact matches (KL3 <b>4</b> → KL3).</li>
+          <li>Narrow the search with the package filter.</li>
+          <li>Try camera OCR or upload a photo.</li>
+          <li>Search by part number instead of marking.</li>
+          <li>MiniMELF diodes and resistors use rings and digits, not codes.</li>
+        </ul>
+        <div id="didYouMean" class="dym"></div>
+      </div>
+    </div>
+
+    <div class="col-right">
+      <div class="col-head"><h2>Selected Candidate</h2></div>
+      <div id="detail" class="detail">
+        <div id="detailBody" class="detail-body">
+          <div class="ph">Select a candidate on the left</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ DATASHEET RAG ============================ -->
+  <section class="panel rag">
+    <h2 class="panel-title">2 · Search your datasheets (RAG)</h2>
+    <p class="rag-lede">Ask a question in plain words and get the passage from your own PDF
+       library — with the part number, section and page it came from. Retrieval is BM25 over a
+       local SQLite index; dense vectors are added automatically if an embedding backend is
+       configured.</p>
+
+    <div class="search-row">
+      <input id="ragQ" type="text" autocomplete="off" spellcheck="false"
+             placeholder="e.g. collector current, dropout voltage, pinout, package dimensions…">
+      <button id="btnRagSearch" class="btn btn-primary">Search datasheets</button>
+    </div>
+
+    <div class="row">
+      <span class="row-label">Part:</span>
+      <select id="ragPart" class="select"><option value="">All parts</option></select>
+      <span class="row-label">Section:</span>
+      <div id="ragSections" class="chips"></div>
+    </div>
+
+    <div id="ragStatus" class="rag-status">Checking index…</div>
+    <div id="ragResults" class="rag-results"></div>
+
+    <div id="ragHelp" class="rag-help hidden">
+      <b>The datasheet index is not reachable.</b>
+      <p>Serve the app with the bundled server (it exposes both the site and the API on one
+         origin) and build the index once:</p>
+      <pre>python3 tools/rag/pipeline.py --corpus data/datasheets --rebuild
+python3 tools/rag/serve.py --port 8000</pre>
+      <p class="muted">No PDFs yet? Generate a demo corpus:
+         <code>python3 tools/rag/sample_datasheets.py</code></p>
+    </div>
+  </section>
+
+  <!-- ============================ DATABASE ============================ -->
+  <section class="panel db">
+    <h2 class="panel-title">3 · Marking database</h2>
+    <div class="db-head">
+      <div id="dbInfo" class="db-info"></div>
+      <div class="db-actions">
+        <button id="btnImport" class="btn">Import CSV / JSON</button>
+        <input id="importInput" type="file" accept=".csv,.json,.txt" hidden>
+      </div>
+    </div>
+    <div class="hint">
+      CSV columns: <code>part,mfr,pkg,type,desc,v,i,pins,markings,conf,note</code>
+      (markings separated by “|”, conf is high/med/low). Imported rows are stored in your
+      browser's localStorage and never leave the device.
+    </div>
+  </section>
+
+  <footer class="foot">
+    <p><b>Privacy note:</b> marking search, OCR and the datasheet index all run locally. Nothing is
+       uploaded; query history and imported rows stay in your browser's localStorage.</p>
+    <p class="muted">The bundled marking database is a seed set, not an authoritative source.
+       Always confirm against the manufacturer datasheet before replacing a component.</p>
+  </footer>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script src="assets/js/data.js"></script>
+<script src="assets/js/matcher.js"></script>
+<script src="assets/js/ocr.js"></script>
+<script src="assets/js/app.js"></script>
+</body>
+</html>
