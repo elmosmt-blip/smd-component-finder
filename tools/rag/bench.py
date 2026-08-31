@@ -93,6 +93,8 @@ def main() -> int:
     ap.add_argument("--target", type=int, default=300000,
                     help="extrapolate to this many files (default 300000)")
     ap.add_argument("--parser", default="auto", choices=["auto", "pdfplumber", "docling"])
+    ap.add_argument("--docling-pages", default=None, choices=["tables", "all"],
+                    help="with Docling: only pages with tables (default) or all pages")
     args = ap.parse_args()
 
     corpus = args.corpus.expanduser()
@@ -123,7 +125,8 @@ def main() -> int:
     print("Sample:   %d PDFs, %.1f MB (includes the largest files)" % (len(sample), total_mb))
     print(BAR)
 
-    parser_used = parsers.get_parser(args.parser)
+    docling_opts = {"pages": args.docling_pages} if args.docling_pages else {}
+    parser_used = parsers.get_parser(args.parser, **docling_opts)
     print("Parser:   %s" % parser_used.name)
     for reason in getattr(parser_used, "fallback_errors", []) or []:
         print("          (skipped %s)" % reason.split(":")[0])

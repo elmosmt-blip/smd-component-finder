@@ -39,7 +39,7 @@ from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from tools.rag import card_store, index_db, ingest
+from tools.rag import card_store, index_db, ingest, opensearch_index
 from tools.rag.embeddings import get_backend
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -88,8 +88,10 @@ class Handler(SimpleHTTPRequestHandler):
         return store
 
     def _index(self):
-        return index_db.RagIndex(INDEX_PATH, embedding_backend=get_backend(
-            self.server.embed_backend))
+        return opensearch_index.open_index(
+            INDEX_PATH, embedding_backend=get_backend(self.server.embed_backend),
+            url=getattr(self.server, "os_url", None),
+            prefer=getattr(self.server, "index_backend", None))
 
     def log_message(self, fmt: str, *args) -> None:  # quieter logs
         if "/api/" in (args[0] if args else ""):
@@ -347,6 +349,11 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--jobs", type=int, default=0,
                     help="workers for PDF ingestion (default: CPU count)")
+    ap.add_argument("--backend", default=None,
+                    choices=["auto", "opensearch", "sqlite"],
+                    help="index engine: auto picks OpenSearch when reachable")
+    ap.add_argument("--opensearch-url", default=None,
+                    help="e.g. http://localhost:9200 (or set SMD_OPENSEARCH_URL)")
     ap.add_argument("--embed", default="none",
                     choices=["none", "auto", "sentence-transformers", "st", "openai"])
     args = ap.parse_args()
@@ -357,6 +364,8 @@ def main() -> int:
     handler = lambda *a, **kw: Handler(*a, directory=str(ROOT), **kw)  # noqa: E731
     httpd = ThreadingHTTPServer((args.host, args.port), handler)
     httpd.embed_backend = args.embed
+    httpd.index_backend = args.backend
+    httpd.os_url = args.opensearch_url
     httpd.jobs = args.jobs
 
     stats = {}

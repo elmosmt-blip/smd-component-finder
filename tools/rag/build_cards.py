@@ -99,7 +99,8 @@ def _fmt_eta(seconds: float) -> str:
 
 def build(corpus: Path, out: Path, parser_name: str = "auto", jobs: int = 0,
           limit: int = 0, shard: Optional[str] = None, rebuild: bool = False,
-          shards: bool = True, verbose: bool = False) -> dict:
+          shards: bool = True, verbose: bool = False,
+          docling_pages: Optional[str] = None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
 
     pdfs = ingest.find_pdfs(corpus)
@@ -132,7 +133,8 @@ def build(corpus: Path, out: Path, parser_name: str = "auto", jobs: int = 0,
             finally:
                 con.close()
 
-    parser_used = parsers.get_parser(parser_name)   # before forking: see ingest._warmup
+    docling_opts = {"pages": docling_pages} if docling_pages else {}
+    parser_used = parsers.get_parser(parser_name, **docling_opts)  # before forking
     runner = ingest.JobRunner(out, parser=parser_name, jobs=jobs)
     job_id = runner.start(pdfs, shards=shards)
     print("Parser:      %s" % parser_used.name)
@@ -205,6 +207,8 @@ def main() -> int:
     ap.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--parser", default="auto", choices=["auto", "docling", "pdfplumber"])
+    ap.add_argument("--docling-pages", default=None, choices=["tables", "all"],
+                    help="send Docling only the pages with tables (default) or every page")
     ap.add_argument("--jobs", type=int, default=0, help="workers (default: CPU count)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--shard", default=None, help="i/n — process every n-th file")
@@ -243,7 +247,8 @@ def main() -> int:
 
     stats = build(args.corpus, args.out, parser_name=args.parser, jobs=args.jobs,
                   limit=args.limit, shard=args.shard, rebuild=args.rebuild,
-                  shards=not args.no_shards, verbose=args.verbose)
+                  shards=not args.no_shards, verbose=args.verbose,
+                  docling_pages=args.docling_pages)
     print("\nDatabase: %d cards" % stats["cards"])
     return 0
 

@@ -20,10 +20,11 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from tools.rag import chunking, index_db, metadata, parsers
+from tools.rag import chunking, index_db, metadata, opensearch_index, parsers
 from tools.rag.embeddings import get_backend
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -32,22 +33,25 @@ DEFAULT_OUT = ROOT / "data" / "rag"
 
 
 def build(corpus: Path, out: Path, parser_name: str = "auto", embed: str = "none",
-          rebuild: bool = False, limit: int = 0, verbose: bool = False) -> dict:
+          rebuild: bool = False, limit: int = 0, verbose: bool = False,
+          backend: str = "auto", docling_pages: Optional[str] = None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     db_path = out / "index.db"
     (out / "parsed").mkdir(exist_ok=True)
 
-    backend = get_backend(embed)
-    index = index_db.RagIndex(db_path, embedding_backend=backend)
+    embedder = get_backend(embed)
+    index = opensearch_index.open_index(db_path, embedding_backend=embedder,
+                                         prefer=backend, verbose=verbose)
     if rebuild:
         index.reset()
 
-    parser = parsers.get_parser(parser_name)
+    docling_opts = {"pages": docling_pages} if docling_pages else {}
+    parser = parsers.get_parser(parser_name, **docling_opts)
     print("Parser:      %s" % parser.name)
     for reason in getattr(parser, "fallback_errors", []) or []:
         print("             (skipped %s)" % reason.split(":")[0] +
               " — " + reason.split("Original error:")[-1].strip()[:90])
-    print("Embeddings:  %s" % backend.describe())
+    print("Embeddings:  %s" % embedder.describe())
 
     pdfs = sorted(corpus.glob("*.pdf"))
     if not pdfs:
@@ -125,7 +129,7 @@ def build(corpus: Path, out: Path, parser_name: str = "auto", embed: str = "none
                parsed.n_pages, len(chunks), meta.confidence)
         )
 
-    built_vectors = index.build_vectors() if backend.name != "none" else 0
+    built_vectors = index.build_vectors() if embedder.name != "none" else 0
     index.set_meta("parser", (parser.name + (" (fallback)" if fallback_used else "")))
     index.set_meta("built_at", time.strftime("%Y-%m-%d %H:%M:%S"))
     index.set_meta("chunker", splitter.backend)
@@ -141,7 +145,8 @@ def build(corpus: Path, out: Path, parser_name: str = "auto", embed: str = "none
 
 def query(out: Path, q: str, part: str | None = None, section: str | None = None,
           k: int = 6, embed: str = "none") -> None:
-    index = index_db.RagIndex(out / "index.db", embedding_backend=get_backend(embed))
+    index = opensearch_index.open_index(out / "index.db",
+                                         embedding_backend=get_backend(embed))
     if not index.stats()["chunks"]:
         print("Index is empty — run the pipeline first.")
         return
@@ -167,6 +172,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Build and query the datasheet RAG index")
     ap.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--docling-pages", default=None, choices=["tables", "all"],
+                    help="Docling only on pages with tables (default) or on every page")
+    ap.add_argument("--backend", default=None, choices=["auto", "opensearch", "sqlite"],
+                    help="index engine: auto uses OpenSearch when it answers")
     ap.add_argument("--parser", default="auto", choices=["auto", "docling", "pdfplumber"])
     ap.add_argument("--embed", default="none",
                     choices=["none", "auto", "sentence-transformers", "st", "openai"])
@@ -184,10 +193,12 @@ def main() -> int:
         query(args.out, args.query, args.part, args.section, args.k, args.embed)
         return 0
     if args.stats:
-        idx = index_db.RagIndex(args.out / "index.db")
+        idx = opensearch_index.open_index(args.out / "index.db")
         print(json.dumps(idx.stats(), indent=2, ensure_ascii=False))
         return 0
-    build(args.corpus, args.out, args.parser, args.embed, args.rebuild, args.limit, args.verbose)
+    build(args.corpus, args.out, args.parser, args.embed, args.rebuild, args.limit,
+          args.verbose, backend=args.backend or "auto",
+          docling_pages=args.docling_pages)
     return 0
 
 

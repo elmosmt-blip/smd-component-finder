@@ -18,10 +18,12 @@ one was used.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -67,9 +69,49 @@ class BaseParser:
 # --------------------------------------------------------------------------- #
 
 class DoclingParser(BaseParser):
-    """IBM Docling. Requires `pip install docling` and access to HF weights."""
+    """IBM Docling — layout analysis and TableFormer instead of text soup.
+
+    Why it is worth the trouble for datasheets: `pdfplumber` guesses cell
+    boundaries from ruling lines and character positions, so a pinout table
+    without vertical rules comes out as one column of "1 Base Control input".
+    Docling runs a layout model and then TableFormer on every table region,
+    which is what keeps Pitch and Lead Width in their own columns.
+
+    Two things decide whether this is usable on 300k files, and both are
+    handled here:
+
+      * **Models must be loaded once per worker, not once per PDF.** The
+        converter is cached on the module, so a worker process pays for the
+        weights on its first file and never again.
+      * **Full Docling on every page is far too slow for a whole library.**
+        `pages="tables"` (the default) makes a cheap pdfplumber pass first and
+        sends Docling only the pages that actually contain tables — usually
+        10–20 % of a datasheet.
+
+    Environment:
+        SMD_DOCLING_PAGES       tables | all          (default: tables)
+        SMD_DOCLING_TABLE_MODE  fast | accurate       (default: fast)
+        SMD_DOCLING_DEVICE      auto | cpu | cuda     (default: auto)
+        SMD_DOCLING_THREADS     threads per worker    (default: 2)
+        DOCLING_ARTIFACTS_PATH  where the weights live (Docling's own variable)
+    """
 
     name = "docling"
+
+    # One converter per process per configuration: loading the models is the
+    # single most expensive step and must not repeat 300 000 times.
+    _CONVERTERS: dict = {}
+    _CONVERTER_LOCK = threading.Lock()
+
+    def __init__(self, pages: Optional[str] = None, table_mode: Optional[str] = None,
+                 device: Optional[str] = None, threads: int = 0):
+        self.pages = (pages or os.environ.get("SMD_DOCLING_PAGES") or "tables").lower()
+        self.table_mode = (table_mode or os.environ.get("SMD_DOCLING_TABLE_MODE")
+                           or "fast").lower()
+        self.device = device or os.environ.get("SMD_DOCLING_DEVICE") or "auto"
+        self.threads = int(threads or os.environ.get("SMD_DOCLING_THREADS") or 2)
+
+    # ------------------------------------------------------------- availability
 
     def is_available(self) -> bool:
         try:
@@ -77,17 +119,211 @@ class DoclingParser(BaseParser):
         except ImportError as exc:
             raise ParserUnavailable(
                 "Docling is not installed. Run: pip install docling "
-                "(heavy: torch + models). Original error: %s" % exc
+                "(heavy: torch + transformers). Original error: %s" % exc
             ) from exc
         return True
 
+    # --------------------------------------------------------------- docling io
+
+    def _options(self):
+        from docling.datamodel.pipeline_options import (
+            AcceleratorOptions, PdfPipelineOptions, TableFormerMode)
+
+        opts = PdfPipelineOptions()
+        # Tables are the whole point; page images are not — they cost time and
+        # gigabytes on a 300k run and we never look at them.
+        opts.do_table_structure = True
+        opts.do_ocr = False
+        opts.generate_page_images = False
+        opts.generate_picture_images = False
+        try:
+            opts.table_structure_options.mode = (
+                TableFormerMode.ACCURATE if self.table_mode.startswith("acc")
+                else TableFormerMode.FAST)
+            opts.table_structure_options.do_cell_matching = True
+        except Exception:                        # noqa: BLE001 - version drift
+            pass
+        try:
+            # We parallelise with processes, so Docling must not spawn 32
+            # threads per worker on top of that.
+            opts.accelerator_options = AcceleratorOptions(
+                device=self.device, num_threads=max(1, self.threads))
+        except Exception:                        # noqa: BLE001
+            pass
+        return opts
+
+    def _converter(self):
+        key = (self.pages, self.table_mode, self.device, self.threads)
+        with self._CONVERTER_LOCK:
+            conv = self._CONVERTERS.get(key)
+            if conv is None:
+                from docling.datamodel.base_models import InputFormat
+                from docling.document_converter import DocumentConverter, PdfFormatOption
+                conv = DocumentConverter(format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=self._options())
+                })
+                self._CONVERTERS[key] = conv
+            return conv
+
+    def _convert(self, path: Path, page_range=None):
+        kwargs = {"page_range": page_range} if page_range else {}
+        return self._converter().convert(str(path), **kwargs)
+
+    @staticmethod
+    def _table_rows(item, doc) -> List[List[str]]:
+        """One Docling TableItem -> rows of strings, header row included."""
+        try:
+            frame = item.export_to_dataframe(doc=doc)
+        except Exception:                        # noqa: BLE001
+            try:
+                frame = item.export_to_dataframe()
+            except Exception:                    # noqa: BLE001
+                return []
+        try:
+            header = [("" if c is None else str(c)).strip() for c in frame.columns]
+            rows = [["" if v is None else str(v).strip() for v in rec]
+                    for rec in frame.values.tolist()]
+        except Exception:                        # noqa: BLE001
+            return []
+        out = [header] if any(header) else []
+        out += [r for r in rows if any(r)]
+        return out
+
+    def _docling_tables(self, doc, page_offset: int = 0) -> Dict[int, List[List[List[str]]]]:
+        """Tables grouped by page number, straight from Docling.
+
+        `page_offset` fixes a subtlety: when converting `page_range=(7, 9)`,
+        Docling numbers the pages it was given, so page 1 of the result is
+        document page 7.
+        """
+        tables: Dict[int, List[List[List[str]]]] = {}
+        try:
+            items = list(doc.iterate_items())
+        except Exception:                        # noqa: BLE001
+            return tables
+        for item, _level in items:
+            # Duck-typed, not isinstance(TableItem): the tests run without
+            # docling installed, and this must stay importable without it.
+            if not self._looks_like_table(item):
+                continue
+            prov = getattr(item, "prov", None) or []
+            page_no = getattr(prov[0], "page_no", 1) if prov else 1
+            rows = self._table_rows(item, doc)
+            if rows:
+                tables.setdefault(int(page_no) + page_offset, []).append(rows)
+        return tables
+
+    @staticmethod
+    def _looks_like_table(item) -> bool:
+        if not hasattr(item, "export_to_dataframe"):
+            return False
+        if type(item).__name__ == "TableItem":
+            return True
+        return str(getattr(item, "label", "")).lower().endswith("table")
+
+    def _page_markdown(self, doc, number: int) -> str:
+        try:
+            return doc.export_to_markdown(page_no=number)
+        except Exception:                        # noqa: BLE001 - older docling
+            return ""
+
+    # -------------------------------------------------------------------- parse
+
+    def parse(self, path: Path) -> ParsedDoc:
+        self.is_available()
+        sha1 = _sha1(path)
+        if self.pages == "all":
+            return self._parse_whole(path, sha1)
+        return self._parse_table_pages(path, sha1)
+
+    def _parse_whole(self, path: Path, sha1: str) -> ParsedDoc:
+        try:
+            result = self._convert(path)
+        except Exception as exc:                 # noqa: BLE001
+            raise ParserUnavailable(
+                "Docling could not convert %s (%s: %s). The usual cause is "
+                "missing model weights: Docling downloads them from "
+                "HuggingFace on first use (see DOCLING_ARTIFACTS_PATH)."
+                % (path.name, type(exc).__name__, exc)
+            ) from exc
+        doc = result.document
+        try:
+            markdown = doc.export_to_markdown()
+        except Exception:                        # noqa: BLE001
+            markdown = ""
+
+        pages: List[Page] = []
+        tables = self._docling_tables(doc)
+        try:
+            numbers = sorted(getattr(doc, "pages", {}) or {})
+        except Exception:                        # noqa: BLE001
+            numbers = []
+        if not numbers:
+            numbers = sorted(set(list(tables) + [1])) or [1]
+        for number in numbers:
+            text = self._page_markdown(doc, number) if numbers else markdown
+            pages.append(Page(number=int(number), text=text or "",
+                              tables=tables.get(int(number), [])))
+        if any(p.tables for p in pages):
+            pass                                  # Docling's tables are enough
+        else:
+            # Older versions, or a build without table structure.
+            self._fill_tables(path, pages)
+        return ParsedDoc(doc_id=_doc_id(path), filename=path.name, sha1=sha1,
+                         pages=pages, markdown=markdown, parser=self.name)
+
+    def _parse_table_pages(self, path: Path, sha1: str) -> ParsedDoc:
+        """Cheap pass first, Docling only where tables actually are."""
+        base = PdfPlumberParser().parse(path)
+        candidates = [p.number for p in base.pages if p.tables]
+        if not candidates:
+            # No tables -> nothing for TableFormer to improve.
+            return base
+
+        upgraded = 0
+        for start, end in _ranges(candidates):
+            try:
+                result = self._convert(path, page_range=(start, end))
+            except Exception:                    # noqa: BLE001 - keep the cheap pass
+                continue
+            doc = result.document
+            tables = self._docling_tables(doc)
+            if tables and min(tables) == 1 and start > 1:
+                # Docling renumbered the pages inside the range.
+                tables = {k + (start - 1): v for k, v in tables.items()}
+            for number in range(start, end + 1):
+                if not (1 <= number <= len(base.pages)):
+                    continue
+                page = base.pages[number - 1]
+                # Inside a page_range Docling numbers pages from 1 again, so
+                # page `start` of the document is page 1 of this result.
+                text = self._page_markdown(doc, number - start + 1)
+                if text:
+                    page.text = text
+                got = tables.get(number)
+                if got:
+                    page.tables = got
+                    upgraded += 1
+
+        markdown = "\n\n".join(p.text for p in base.pages if p.text)
+        parser_name = self.name if upgraded else "pdfplumber"
+        return ParsedDoc(doc_id=base.doc_id, filename=path.name, sha1=sha1,
+                         pages=base.pages, markdown=markdown, parser=parser_name)
+
     @staticmethod
     def _fill_tables(path: Path, pages: List["Page"]) -> None:
-        """Attach pdfplumber tables to Docling pages, by page number."""
+        """Attach pdfplumber tables to pages, by page number.
+
+        Only a fallback for builds where Docling gives no table objects: the
+        card extractor works from tables, and without them a Docling run would
+        produce beautiful chunks and empty cards.
+        """
         try:
             import pdfplumber
             with pdfplumber.open(str(path)) as pdf:
                 for page in pages:
+                    if page.tables:
+                        continue
                     idx = page.number - 1
                     if not (0 <= idx < len(pdf.pages)):
                         continue
@@ -102,56 +338,19 @@ class DoclingParser(BaseParser):
                         if cleaned:
                             tables.append(cleaned)
                     page.tables = tables
-        except Exception:                      # noqa: BLE001 - tables are a bonus
+        except Exception:                        # noqa: BLE001 - tables are a bonus
             return
 
-    def parse(self, path: Path) -> ParsedDoc:
-        self.is_available()
-        try:
-            from docling.document_converter import DocumentConverter
-        except ImportError as exc:  # pragma: no cover - defensive
-            raise ParserUnavailable("docling import failed: %s" % exc) from exc
 
-        sha1 = _sha1(path)
-        try:
-            converter = DocumentConverter()
-            result = converter.convert(str(path))
-            doc = result.document
-            markdown = doc.export_to_markdown()
-        except Exception as exc:
-            # Most common cause: no network to HuggingFace for the models.
-            raise ParserUnavailable(
-                "Docling could not convert %s (%s: %s). In an offline sandbox "
-                "this usually means the layout/tableformer weights cannot be "
-                "downloaded." % (path.name, type(exc).__name__, exc)
-            ) from exc
-
-        pages = []
-        # Docling keeps page geometry; fall back to a single synthetic page when
-        # the backend does not expose per-page text.
-        try:
-            for number, page in sorted(getattr(doc, "pages", {}).items()):
-                text = getattr(page, "text", "") or ""
-                pages.append(Page(number=int(number), text=text))
-        except Exception:
-            pages = []
-        if not pages:
-            pages = [Page(number=1, text=markdown)]
-
-        # Docling's markdown is excellent for retrieval but carries no per-page
-        # table objects, and the card extractor works from tables. Without this
-        # a Docling run would produce beautiful chunks and empty cards, so the
-        # tables are filled in with pdfplumber (offline, no model weights).
-        self._fill_tables(path, pages)
-
-        return ParsedDoc(
-            doc_id=_doc_id(path),
-            filename=path.name,
-            sha1=sha1,
-            pages=pages,
-            markdown=markdown,
-            parser=self.name,
-        )
+def _ranges(numbers: List[int]) -> List[tuple]:
+    """[1, 2, 3, 7] -> [(1, 3), (7, 7)] — Docling converts one page range."""
+    out: List[tuple] = []
+    for n in sorted(set(numbers)):
+        if out and n == out[-1][1] + 1:
+            out[-1] = (out[-1][0], n)
+        else:
+            out.append((n, n))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -310,7 +509,7 @@ def _pages_to_markdown(pages: List[Page], title: str) -> str:
     return "\n".join(out)
 
 
-def get_parser(preferred: str = "auto") -> BaseParser:
+def get_parser(preferred: str = "auto", **docling_opts) -> BaseParser:
     """Return the best parser that can actually run here.
 
     preferred: 'docling' | 'pdfplumber' | 'auto'
@@ -328,7 +527,8 @@ def get_parser(preferred: str = "auto") -> BaseParser:
 
     errors = []
     for name in order:
-        parser: BaseParser = DoclingParser() if name == "docling" else PdfPlumberParser()
+        parser: BaseParser = (DoclingParser(**docling_opts) if name == "docling"
+                              else PdfPlumberParser())
         try:
             parser.is_available()
             parser.fallback_errors = errors          # why the others were skipped
