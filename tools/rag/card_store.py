@@ -264,7 +264,7 @@ class CardStore:
         with_mfr = self.conn.execute(
             "SELECT COUNT(*) FROM cards WHERE manufacturer IS NOT NULL").fetchone()[0]
         with_ratings = self.conn.execute(
-            "SELECT COUNT(*) FROM cards WHERE card LIKE '%\"ratings\": [{%'").fetchone()[0]
+            "SELECT COUNT(*) FROM cards WHERE card LIKE '%\"ratings\":[{%'").fetchone()[0]
         avg_conf = self.conn.execute(
             "SELECT AVG(confidence) FROM cards").fetchone()[0] or 0.0
         failures = self.conn.execute("SELECT COUNT(*) FROM failures").fetchone()[0]
