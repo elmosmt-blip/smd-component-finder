@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import os
 import platform
-import resource
 import shutil
 import sys
 import tempfile
@@ -31,7 +30,7 @@ from typing import List
 if __package__ in (None, ""):            # started as a script, not a module
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from tools.rag import ingest, parsers  # noqa: E402
+from tools.rag import cli, ingest, parsers  # noqa: E402
 
 BAR = "-" * 64
 
@@ -74,16 +73,30 @@ def total_ram_gb() -> float:
 
 
 def peak_child_rss_mb() -> float:
-    """Highest RSS any worker reached so far, in MB (Linux: ru_maxrss is KB).
+    """Highest RSS any worker reached so far, in MB — 0 where it is unknown.
 
-    This is a high-water mark for the whole run and never goes down, so the
-    number for a later configuration includes the earlier ones. It is here to
-    answer "does 32 workers fit in my RAM", not to compare configurations.
+    `resource` is Unix only and psutil is optional, so on Windows this simply
+    says 0 rather than crashing the benchmark: the number is a hint about how
+    much RAM N workers need, not a correctness check.
+
+    On Unix this is a high-water mark for the whole run and never goes down,
+    so a later configuration includes the earlier ones.
     """
-    return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024.0
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024.0
+    except ImportError:
+        pass
+    try:
+        import psutil
+        rss = [p.memory_info().rss for p in psutil.Process().children(recursive=True)]
+        return (max(rss) if rss else 0) / (1024.0 * 1024.0)
+    except ImportError:
+        return 0.0
 
 
 def main() -> int:
+    cli.fix_windows_console()
     ap = argparse.ArgumentParser(description="Benchmark the PDF parser on this machine")
     ap.add_argument("--corpus", type=Path, default=Path("data/datasheets"))
     ap.add_argument("--files", type=int, default=150,
@@ -174,8 +187,12 @@ def main() -> int:
     print("   %s   with %d workers" % (human(best["hours"]), best["jobs"]))
     print("   %s   with 1 worker, for reference" % human(args.target / single))
     print(BAR)
-    print("Memory: the highest RSS any worker reached was %.0f MB "
-          "(high-water mark for the whole run)." % best["rss"])
+    if best["rss"] > 0:
+        print("Memory: the highest RSS any worker reached was %.0f MB "
+              "(high-water mark for the whole run)." % best["rss"])
+    else:
+        print("Memory: RSS is not measurable here (needs Unix or psutil); "
+              "estimate %.0f MB as workers x largest file." % (best["jobs"] * biggest_mb))
     if ram:
         headroom = ram - best["rss"] / 1024.0
         print("You have %.0f GB, so this leaves about %.0f GB free%s."

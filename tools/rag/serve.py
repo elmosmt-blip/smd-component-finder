@@ -39,7 +39,7 @@ from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from tools.rag import card_store, index_db, ingest, opensearch_index
+from tools.rag import card_store, cli, index_db, ingest, opensearch_index
 from tools.rag.embeddings import get_backend
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -111,6 +111,15 @@ class Handler(SimpleHTTPRequestHandler):
 
         if path.startswith("/cards/"):
             return self._handle_static(path[len("/cards/"):], SITE_CARDS_DIR)
+
+        if path == "/favicon.ico":
+            # The real icon is assets/favicon.svg (linked from index.html).
+            # Browsers ask for /favicon.ico anyway; an empty 204 keeps the
+            # console clean without shipping a second file.
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
 
         return super().do_GET()
 
@@ -344,6 +353,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main() -> int:
+    cli.fix_windows_console()
     ap = argparse.ArgumentParser(description="Serve the finder UI + RAG API")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)

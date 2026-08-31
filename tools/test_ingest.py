@@ -16,6 +16,7 @@ data directory and drives it exactly like the browser does:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -106,10 +107,12 @@ def main() -> int:
     corpus.mkdir(parents=True)
 
     port = free_port()
-    env = {"PATH": "/usr/bin:/bin", "SMD_DATA_DIR": str(data_dir),
-           "PYTHONUNBUFFERED": "1"}
-    env.update({k: v for k, v in __import__("os").environ.items()
-                if k in ("HOME", "TMPDIR", "PYTHONPATH")})
+    # Start from the real environment, not from a hand-made one: on Windows a
+    # stripped env loses SystemRoot, and Winsock then cannot start in the
+    # child — every socket() fails with WSAStartup / WinError 10106.
+    env = dict(os.environ)
+    env["SMD_DATA_DIR"] = str(data_dir)
+    env["PYTHONUNBUFFERED"] = "1"
     log_path = tmp / "server.log"
     log_fh = open(log_path, "w")
     proc = subprocess.Popen(

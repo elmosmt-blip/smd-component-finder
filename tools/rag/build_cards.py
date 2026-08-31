@@ -40,7 +40,7 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from tools.rag import card_store, ingest, parsers  # noqa: E402
+from tools.rag import card_store, cli, ingest, parsers  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_CORPUS = ROOT / "data" / "datasheets"
@@ -203,6 +203,7 @@ def print_stats(out: Path) -> None:
 
 
 def main() -> int:
+    cli.fix_windows_console()
     ap = argparse.ArgumentParser(description="Extract structured cards from a PDF corpus")
     ap.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)

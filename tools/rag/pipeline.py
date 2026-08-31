@@ -24,7 +24,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from tools.rag import chunking, index_db, metadata, opensearch_index, parsers
+from tools.rag import chunking, cli, index_db, metadata, opensearch_index, parsers
 from tools.rag.embeddings import get_backend
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -169,6 +169,7 @@ def query(out: Path, q: str, part: str | None = None, section: str | None = None
 
 
 def main() -> int:
+    cli.fix_windows_console()
     ap = argparse.ArgumentParser(description="Build and query the datasheet RAG index")
     ap.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)

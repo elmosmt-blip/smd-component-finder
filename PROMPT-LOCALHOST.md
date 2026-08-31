@@ -53,6 +53,16 @@
 * Если шаг не прошёл — остановись, напиши что именно и почему. Не
   импровизируй с архитектурой, чтобы «заработало».
 
+ШАГ 0. Определи ОС
+Проект кроссплатформенный. На Windows:
+  * venv: `.venv\Scripts\python` вместо `.venv/bin/python`, активация —
+    `.venv\Scripts\activate`. Все команды ниже пиши через `.venv\Scripts\python`.
+  * Кодировка консоли (cp1251/cp866) чинится сама — инструменты переключают
+    вывод на UTF-8. Ручной PYTHONIOENCODING не требуется.
+  * `docker` чаще всего отсутствует: тогда OpenSearch пропускаем, поиск идёт
+    на SQLite (см. шаг 4), включая векторный канал.
+На Linux/macOS всё как написано ниже.
+
 ШАГ 1. Проверь машину
   python3 --version          # нужно 3.10+
   docker --version && docker compose version
@@ -78,11 +88,20 @@
 Всего 237 проверок (236 без botocore: проверка подписи SigV4 тогда
 пропускается — это норма). Если что-то падает — разберись до следующего шага.
 
-ШАГ 4. OpenSearch
+ШАГ 4. OpenSearch (только если есть docker)
+Если docker отсутствует — пропусти шаг целиком. Поиск останется на SQLite,
+это нормальная конфигурация, а не деградация: BM25 плюс векторы работают и
+там. Векторный канал без всякого Docker включается так:
+  .venv/bin/pip install sentence-transformers
+  .venv/bin/python tools/rag/pipeline.py --rebuild --embed sentence-transformers
+OpenSearch понадобится позже, когда чанков станет больше ~1 млн.
+  # Linux:
   sudo sysctl -w vm.max_map_count=262144
   echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-opensearch.conf
+  # Windows/WSL2: wsl -d docker-desktop sysctl -w vm.max_map_count=262144
   docker compose -f tools/rag/opensearch-compose.yml up -d
   curl -sf http://localhost:9200 && echo "OpenSearch отвечает"
+  # в PowerShell вместо curl: (Invoke-WebRequest http://localhost:9200).StatusCode
 Подожди зелёного healthcheck (до 2 минут):
   docker ps --format '{{.Names}} {{.Status}}'
 Если контейнер рестартует — смотри логи: `docker logs smd-opensearch`
@@ -174,6 +193,7 @@ pdfplumber. Это сделано специально — не «исправл
 ШАГ 14. Отчёт (пришли ровно по этой форме)
 ```
 Вывод tools/rag/doctor.py — целиком, без сокращений
+ОС: Windows 11 / Ubuntu 24.04 / ... (что есть), docker есть / нет
 Машина: CPU ..., ядер N, RAM ... ГБ, диск свободно ... ГБ
 Окружение: python X.Y, docker Z, ветка arena/... коммит <hash>
 Тесты: 237/237, либо 236/236 без botocore (если меньше — что упало и почему)
@@ -197,6 +217,12 @@ Docling: установлен / нет; если да — скорость и к
 * Docling не может скачать веса — нет доступа к huggingface.co: положи веса
   вручную и укажи DOCLING_ARTIFACTS_PATH.
 * Порт 8000 занят — `--port 8001` (и поменяй URL в отчёте).
+* Windows, `WinError 10106 / WSAStartup` в тестах — значит окружение
+  подпроцесса обрезано (нет SystemRoot). Тест берёт полное окружение; если
+  ошибка всё равно есть, запусти тест из обычного PowerShell, а не из
+  Start-Process.
+* Windows, `ModuleNotFoundError: resource` — это старая версия bench.py;
+  обновись до коммита, где память считается через psutil (pip install psutil).
 * В папке «нет PDF» — проверь регистр `.pdf` и права на чтение.
 ````
 

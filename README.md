@@ -203,8 +203,21 @@ python3 tools/rag/serve.py --port 8000 --backend opensearch
 
 Переменные: `SMD_OPENSEARCH_URL`, `SMD_OPENSEARCH_INDEX` (`smd-chunks`),
 `SMD_OPENSEARCH_DIMS`, `SMD_OPENSEARCH_USER/PASS`, `--backend
-auto|opensearch|sqlite`. **Если кластер недоступен, `auto` молча продолжает на
-SQLite** — сайт не падает, просто без векторного канала.
+auto|opensearch|sqlite`. **Если кластера нет, `auto` продолжает на SQLite** —
+сайт не падает.
+
+**Векторный канал работает и без OpenSearch.** Гибрид (BM25 + векторы)
+умеет и SQLite-бэкенд — векторы там хранятся в отдельной таблице и ищутся
+через numpy:
+
+```bash
+.venv/bin/pip install sentence-transformers
+python3 tools/rag/pipeline.py --rebuild --embed sentence-transformers
+```
+
+OpenSearch нужен не для векторов как таковых, а для масштаба: на 300 тысячах
+даташитов это ~15 млн чанков, и один процесс с numpy по ним уже не успевает.
+До примерно миллиона чанков SQLite хватает.
 
 Зависимость от `opensearch-py` не вводится намеренно: модуль говорит с кластером
 по HTTP через urllib — так же, как `fetch_s3.py` подписывает запросы сам, без
@@ -514,6 +527,27 @@ python3 tools/rag/doctor.py                 # диагноз: что стоит 
 Если что-то не работает, начните с `python3 tools/rag/doctor.py`: он печатает
 железо, установленные пакеты, доступность OpenSearch, содержимое баз, последние
 сбои разбора и состояние сайта. Вывод можно целиком прислать в чат.
+
+## Windows
+
+Проект кроссплатформенный, но несколько вещей на Windows отличаются:
+
+* **Кодировка.** PowerShell и cmd по умолчанию отдают cp1251/cp866, из-за чего
+  °, µ и → в выводе превращаются в кракозябры. Все консольные инструменты
+  сами переключают stdout/stderr на UTF-8 (`tools/rag/cli.py`), так что
+  `PYTHONIOENCODING=utf-8` больше не нужен.
+* **OpenSearch.** Без Docker его не поднять. Варианты: Docker Desktop, WSL2
+  (`wsl --install`, дальше всё как на Ubuntu) или просто работать на SQLite —
+  включая векторный канал, см. выше.
+* **Запуск сайта.** Обычно из того же терминала:
+  `.venv\Scripts\python tools\rag\serve.py --port 8000 --jobs 8`.
+  Через `Start-Process` тоже работает, но логи тогда не видны — для отладки
+  запускайте в обычном окне.
+* **Пути.** В поле «Folder path» на сайте годится и `C:\Datasheets`, и
+  `C:/Datasheets`. Слэши в любую сторону — путь всё равно дойдёт.
+* **Производительность.** Пул процессов на Windows стартует медленнее, чем
+  fork на Linux, поэтому на больших корпусах выигрыш от `--jobs 32` меньше,
+  чем на Ubuntu. Замеряйте `bench.py` на своей машине.
 
 ## Ограничения
 

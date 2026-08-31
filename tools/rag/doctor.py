@@ -28,6 +28,8 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tools.rag import cli  # noqa: E402
+
 DATA_DIR = Path(os.environ.get("SMD_DATA_DIR") or (ROOT / "data"))
 CARDS = DATA_DIR / "cards" / "cards.db"
 INDEX = DATA_DIR / "rag" / "index.db"
@@ -198,6 +200,7 @@ def corpus() -> None:
 
 
 def main() -> int:
+    cli.fix_windows_console()
     print(LINE)
     print("Диагнотика SMD Component Finder — %s"
           % time.strftime("%Y-%m-%d %H:%M:%S"))
