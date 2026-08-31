@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMD Component Finder — поиск по маркировке SMD</title>
+<meta name="description" content="Локальный инструмент идентификации SMD-компонентов по маркировке, номеру детали или OCR-снимку с камеры. Всё считается в браузере.">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<a class="skip" href="#main-content">Перейти к содержимому</a>
+
+<header class="topbar">
+  <div class="wrap">
+    <div class="crumbs"><span class="badge">Engineer Tool</span> <a href="#" class="back">← Все инструменты</a></div>
+    <h1>SMD Component Finder</h1>
+    <p class="lede">Поиск SMD-маркировок, номеров деталей и OCR-снимков в одной рабочей среде.
+       Всё считается локально в браузере — ни один байт не уходит на сервер.</p>
+
+    <div class="specs">
+      <div class="spec"><span class="spec-k">Input</span><span class="spec-v">Маркировка, номер детали или OCR</span></div>
+      <div class="spec"><span class="spec-k">Best For</span><span class="spec-v">Быстрая идентификация корпуса</span></div>
+      <div class="spec"><span class="spec-k">Output</span><span class="spec-v">Кандидаты + переход к PDF</span></div>
+      <div class="spec"><span class="spec-k">Workflow</span><span class="spec-v">Ввод → корпус → сравнение → проверка</span></div>
+    </div>
+
+    <ol class="workflow">
+      <li>Введите верхнюю маркировку, номер детали или результат OCR.</li>
+      <li>Сузьте кандидатов по семейству корпуса.</li>
+      <li>Сравните уверенность, корпус, производителя и данные даташита.</li>
+      <li>Проверьте распиновку и предельные параметры перед заменой.</li>
+    </ol>
+  </div>
+</header>
+
+<main id="main-content" class="wrap">
+
+  <!-- ============================ ПОИСК ============================ -->
+  <section class="panel">
+    <div class="search-row">
+      <input id="q" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Маркировка, номер детали или OCR: 1A, A7, 78M05, SI2301…">
+      <button id="btnSearch" class="btn btn-primary">Search</button>
+      <button id="btnCamera" class="btn">Camera / OCR</button>
+    </div>
+
+    <div class="row">
+      <span class="row-label">Примеры:</span>
+      <div id="examples" class="chips"></div>
+    </div>
+
+    <div class="row">
+      <span class="row-label">Корпус:</span>
+      <select id="pkgSelect" class="select"></select>
+    </div>
+
+    <div class="row">
+      <div id="pkgChips" class="chips"></div>
+      <div id="pkgMeta" class="pkg-meta"></div>
+    </div>
+
+    <div class="row opts">
+      <label class="switch"><input type="checkbox" id="optOnline" checked> <span>Online Search</span></label>
+      <label class="switch"><input type="checkbox" id="optAutoPdf"> <span>Open PDF Immediately</span></label>
+      <span class="hint">Держите «Open PDF Immediately» выключенным при сравнении кандидатов —
+        браузер может блокировать автоматические вкладки с PDF.</span>
+    </div>
+
+    <div id="history" class="history"></div>
+  </section>
+
+  <!-- ============================ OCR ============================ -->
+  <section id="ocrPanel" class="panel ocr">
+    <div class="ocr-layout">
+      <div class="ocr-left">
+        <div id="stage" class="stage">
+          <video id="video" playsinline muted style="display:none"></video>
+          <div id="cropBox" class="crop-box">
+            <span class="crop-hint">Потяните рамку по маркировке</span>
+            <i class="handle" data-handle="se"></i>
+          </div>
+          <div class="stage-empty" id="stageEmpty">Наведите камеру на маркировку компонента</div>
+        </div>
+        <div id="ocrStatus" class="ocr-status">Камера не запущена</div>
+
+        <div class="ocr-controls">
+          <button id="btnStartCam" class="btn">Start Camera</button>
+          <button id="btnCapture" class="btn">Capture Image</button>
+          <button id="btnAnalyze" class="btn btn-primary" disabled>Analyze Current Crop</button>
+          <button id="btnSwitch" class="btn">Switch Camera</button>
+          <button id="btnUpload" class="btn">Upload File</button>
+          <input id="fileInput" type="file" accept="image/*" hidden>
+        </div>
+
+        <div class="ocr-opts">
+          <div class="opt-group">
+            <span class="row-label">Кадрирование:</span>
+            <label class="radio"><input type="radio" name="cropMode" value="auto" checked> Auto Crop Marking</label>
+            <label class="radio"><input type="radio" name="cropMode" value="center"> Center Crop</label>
+            <label class="radio"><input type="radio" name="cropMode" value="full"> Use Full Image</label>
+          </div>
+          <div class="opt-group">
+            <span class="row-label">Размер маркировки:</span>
+            <button class="chip" data-preset="small">Small Mark</button>
+            <button class="chip chip-on" data-preset="wide">Wide IC Mark</button>
+            <button class="chip" data-preset="large">Large Package</button>
+          </div>
+        </div>
+        <div class="hint">Маркировка на чёрном компаунде — это светлый текст на тёмном фоне:
+          движок автоматически прогоняет инверсию. Для результата важнее всего боковая подсветка
+          и резкость, а не разрешение.</div>
+      </div>
+
+      <div class="ocr-right">
+        <div id="ocrResults" class="ocr-results"></div>
+        <div class="ocr-tips">
+          <b>Как получить читаемый кадр</b>
+          <ul>
+            <li>Подсветите корпус сбоку фонариком — блик прямо в объектив убивает контраст.</li>
+            <li>Подойдите на 3–8 см, используйте макрорежим или цифровой зум.</li>
+            <li>Обрежьте кадр так, чтобы маркировка занимала ≥ 60 % ширины рамки.</li>
+            <li>Если код не читается — введите его вручную: часто хватает 2–3 символов.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ РЕЗУЛЬТАТЫ ============================ -->
+  <section class="results-layout">
+    <div class="col-left">
+      <div class="col-head">
+        <h2>Кандидаты</h2>
+        <span id="resultsCount" class="muted"></span>
+      </div>
+      <div id="strategy" class="strategy"></div>
+      <div id="results" class="results"></div>
+
+      <div id="empty" class="empty hidden">
+        <div class="empty-icon">!</div>
+        <div class="empty-title">Ничего не найдено</div>
+        <p class="muted">Попробуйте другой запрос или проверьте маркировку.</p>
+        <ul class="empty-tips">
+          <li>Уберите суффикс — код партии/даты часто мешает (KL3 <b>4</b> → KL3).</li>
+          <li>Сузьте поиск фильтром корпуса.</li>
+          <li>Попробуйте OCR с камеры или загрузите фото.</li>
+          <li>Ищите по номеру детали, а не по маркировке.</li>
+          <li>Помните: MiniMELF и резисторы маркируются кольцами и цифрами, а не кодом.</li>
+        </ul>
+        <div id="didYouMean" class="dym"></div>
+      </div>
+    </div>
+
+    <div class="col-right">
+      <div class="col-head"><h2>Selected Candidate</h2></div>
+      <div id="detail" class="detail">
+        <div id="detailBody" class="detail-body">
+          <div class="ph">Выберите кандидата слева</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ БАЗА ============================ -->
+  <section class="panel db">
+    <div class="db-head">
+      <div id="dbInfo" class="db-info"></div>
+      <div class="db-actions">
+        <button id="btnImport" class="btn">Import CSV / JSON</button>
+        <input id="importInput" type="file" accept=".csv,.json,.txt" hidden>
+      </div>
+    </div>
+    <div class="hint">
+      Формат CSV: <code>part,mfr,pkg,type,desc,v,i,pins,markings,conf,note</code>
+      (markings — через «|», conf — high/med/low). Импортированные записи сохраняются
+      в localStorage вашего браузера и не покидают устройство.
+    </div>
+  </section>
+
+  <footer class="foot">
+    <p><b>Privacy note:</b> все вычисления выполняются в вашем браузере. Данные не отправляются
+       на сервер; история запросов и импортированные записи хранятся только в localStorage.</p>
+    <p class="muted">Демо-датасет не является авторитетным источником маркировок. Перед заменой
+       компонента сверяйтесь с datasheet производителя.</p>
+  </footer>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script src="assets/js/data.js"></script>
+<script src="assets/js/matcher.js"></script>
+<script src="assets/js/ocr.js"></script>
+<script src="assets/js/app.js"></script>
+</body>
+</html>

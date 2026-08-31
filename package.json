@@ -1,0 +1,18 @@
+{
+  "name": "smd-component-finder",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Идентификация SMD-компонентов по маркировке, номеру детали или OCR — целиком в браузере",
+  "scripts": {
+    "test": "node tools/test-matcher.js && node tools/test-ui.js",
+    "test:matcher": "node tools/test-matcher.js",
+    "test:ui": "node tools/test-ui.js",
+    "import": "node tools/import_dataset.mjs",
+    "serve": "python3 -m http.server 8000"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  },
+  "keywords": ["smd", "marking", "identification", "ocr", "electronics", "repair"],
+  "license": "MIT"
+}
