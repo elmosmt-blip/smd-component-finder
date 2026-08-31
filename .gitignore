@@ -1,0 +1,19 @@
+node_modules/
+npm-debug.log*
+.DS_Store
+
+# результат импорта своей базы (генерируется tools/import_dataset.mjs)
+data/extra-parts.json
+
+# индекс RAG: генерируется tools/rag/pipeline.py из data/datasheets
+data/rag/
+
+# карточки и статические шарды: генерируются tools/rag/build_cards.py
+data/cards/
+
+# PDF, загруженные через веб-интерфейс: копии того, что уже в data/datasheets
+data/datasheets/uploaded/
+
+__pycache__/
+*.pyc
+.venv/
