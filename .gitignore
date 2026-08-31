@@ -8,6 +8,9 @@ data/extra-parts.json
 # индекс RAG: генерируется tools/rag/pipeline.py из data/datasheets
 data/rag/
 
+# карточки и статические шарды: генерируются tools/rag/build_cards.py
+data/cards/
+
 __pycache__/
 *.pyc
 .venv/

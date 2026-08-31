@@ -27,12 +27,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from tools.rag import index_db
+from tools.rag import card_store, index_db
 from tools.rag.embeddings import get_backend
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 INDEX_PATH = ROOT / "data" / "rag" / "index.db"
+CARDS_PATH = ROOT / "data" / "cards" / "cards.db"
 PDF_DIR = ROOT / "data" / "datasheets"
+SITE_CARDS_DIR = ROOT / "data" / "cards" / "site"
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -48,6 +50,14 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _cards(self):
+        """One shared connection per server process — SQLite dislikes churn."""
+        store = getattr(self.server, "_card_store", None)
+        if store is None:
+            store = card_store.CardStore(CARDS_PATH)
+            self.server._card_store = store
+        return store
 
     def _index(self):
         return index_db.RagIndex(INDEX_PATH, embedding_backend=get_backend(
@@ -69,6 +79,9 @@ class Handler(SimpleHTTPRequestHandler):
         if path.startswith("/pdfs/"):
             return self._handle_pdf(path[len("/pdfs/"):])
 
+        if path.startswith("/cards/"):
+            return self._handle_static(path[len("/cards/"):], SITE_CARDS_DIR)
+
         return super().do_GET()
 
     def _handle_api(self, path: str, qs: dict) -> None:
@@ -77,9 +90,13 @@ class Handler(SimpleHTTPRequestHandler):
                 index = self._index()
                 stats = index.stats()
                 index.close()
+                cards = 0
+                if CARDS_PATH.exists():
+                    cards = self._cards().count()
                 self._json({
                     "ok": True,
                     "indexed": stats["chunks"] > 0,
+                    "cards": cards,
                     "stats": stats,
                 })
                 return
@@ -119,9 +136,65 @@ class Handler(SimpleHTTPRequestHandler):
                 })
                 return
 
+            if path == "/api/cards":
+                q = (qs.get("q") or [""])[0].strip()
+                package = (qs.get("pkg") or [""])[0].strip()
+                mfr = (qs.get("mfr") or [""])[0].strip()
+                family = (qs.get("family") or [""])[0].strip()
+                try:
+                    limit = int((qs.get("limit") or ["60"])[0])
+                    offset = int((qs.get("offset") or ["0"])[0])
+                except ValueError:
+                    limit, offset = 60, 0
+                results, total = self._cards().search(
+                    q=q, package=package, manufacturer=mfr, family=family,
+                    limit=limit, offset=offset)
+                self._json({"query": q, "count": len(results), "total": total,
+                            "offset": offset, "results": results})
+                return
+
+            if path == "/api/card":
+                part = (qs.get("part") or [""])[0].strip()
+                if not part:
+                    self._json({"error": "part is required"}, 400)
+                    return
+                card = self._cards().get(part)
+                if not card:
+                    self._json({"error": "no card for %s" % part}, 404)
+                    return
+                self._json(card)
+                return
+
+            if path == "/api/cards/stats":
+                store = self._cards()
+                payload = store.stats()
+                payload["facets"] = {
+                    "packages": [{"name": n, "count": c}
+                                 for n, c in store.facets()["packages"][:40]],
+                    "manufacturers": [{"name": n, "count": c}
+                                      for n, c in store.facets()["manufacturers"][:40]],
+                }
+                self._json(payload)
+                return
+
             self._json({"error": "unknown endpoint %s" % path}, 404)
         except Exception as exc:  # keep the server alive on any API error
             self._json({"error": "%s: %s" % (type(exc).__name__, exc)}, 500)
+
+    def _handle_static(self, name: str, base: Path) -> None:
+        safe = Path(urllib.parse.unquote(name))
+        target = (base / safe).resolve()
+        if base.resolve() not in target.parents or not target.is_file():
+            self.send_error(404, "not found")
+            return
+        data = target.read_bytes()
+        ctype = "application/json" if target.suffix == ".json" else "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "max-age=60")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_pdf(self, name: str) -> None:
         safe = Path(urllib.parse.unquote(name)).name

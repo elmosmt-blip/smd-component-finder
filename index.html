@@ -201,8 +201,39 @@ python3 tools/rag/serve.py --port 8000</pre>
   </section>
 
   <!-- ============================ DATABASE ============================ -->
+  <section class="panel cards">
+    <h2 class="panel-title">3 · Component cards from your PDFs</h2>
+    <p class="rag-lede">Every datasheet becomes one card: pinout, absolute
+      maximum ratings, key parameters, package dimensions — each value tagged
+      with the page it came from. This is the layer that scales to a real
+      library: <code>tools/rag/build_cards.py</code> walks the corpus in
+      parallel and resumes where it stopped.</p>
+
+    <div class="cards-controls">
+      <input id="cardQ" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Search cards: part number, MOSFET, regulator, SOT-23…">
+      <button id="btnCardSearch" class="btn btn-primary">Search cards</button>
+      <select id="cardPkg" class="select"><option value="">All packages</option></select>
+      <select id="cardMfr" class="select"><option value="">All manufacturers</option></select>
+    </div>
+
+    <div id="cardStatus" class="rag-status">Loading cards…</div>
+    <div id="cardGrid" class="cards-grid"></div>
+    <div class="cards-more"><button id="btnCardMore" class="btn" hidden>Load more</button></div>
+
+    <div id="cardHelp" class="rag-help hidden">
+      <b>No cards yet.</b> Extract them from your PDF library:
+      <pre>python3 -m venv .venv &amp;&amp; .venv/bin/pip install -r tools/requirements.txt
+python3 tools/rag/build_cards.py --corpus data/datasheets --jobs 8
+python3 tools/rag/serve.py --port 8000</pre>
+      The extractor is rule based and offline, so it is a matter of CPU hours
+      rather than API cost. Start with <code>--limit 200</code> to measure the
+      throughput of your machine before launching the full run.
+    </div>
+  </section>
+
   <section class="panel db">
-    <h2 class="panel-title">3 · Marking database</h2>
+    <h2 class="panel-title">4 · Marking database</h2>
     <div class="db-head">
       <div id="dbInfo" class="db-info"></div>
       <div class="db-actions">
@@ -224,6 +255,14 @@ python3 tools/rag/serve.py --port 8000</pre>
        Always confirm against the manufacturer datasheet before replacing a component.</p>
   </footer>
 </main>
+
+<div id="cardModal" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="modal-back" data-close></div>
+  <div class="modal-box">
+    <button class="modal-x" data-close aria-label="Close">&times;</button>
+    <div id="cardModalBody"></div>
+  </div>
+</div>
 
 <div id="toast" class="toast"></div>
 

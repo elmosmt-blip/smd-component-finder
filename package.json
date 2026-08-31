@@ -10,7 +10,9 @@
     "import": "node tools/import_dataset.mjs",
     "serve": "python3 -m http.server 8000",
     "serve:rag": "python3 tools/rag/serve.py --port 8000",
-    "test:rag": "python3 tools/test_rag.py"
+    "test:rag": "python3 tools/test_rag.py",
+    "test:cards": "python3 tools/test_cards.py",
+    "cards": "python3 tools/rag/build_cards.py"
   },
   "devDependencies": {
     "jsdom": "^30.0.1"

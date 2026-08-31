@@ -42,7 +42,8 @@
     cropRect: null,
     stillCanvas: null,
     history: [],
-    rag: { ready: false, part: '', section: '', busy: false }
+    rag: { ready: false, part: '', section: '', busy: false },
+    cards: { q: '', pkg: '', mfr: '', offset: 0, limit: 60, total: 0, ready: false, busy: false }
   };
 
   function $(id) { return document.getElementById(id); }
@@ -73,6 +74,10 @@
       ragQ: $('ragQ'), btnRagSearch: $('btnRagSearch'), ragPart: $('ragPart'),
       ragSections: $('ragSections'), ragStatus: $('ragStatus'),
       ragResults: $('ragResults'), ragHelp: $('ragHelp'),
+      cardQ: $('cardQ'), btnCardSearch: $('btnCardSearch'), cardPkg: $('cardPkg'),
+      cardMfr: $('cardMfr'), cardStatus: $('cardStatus'), cardGrid: $('cardGrid'),
+      btnCardMore: $('btnCardMore'), cardHelp: $('cardHelp'),
+      cardModal: $('cardModal'), cardModalBody: $('cardModalBody'),
       dbInfo: $('dbInfo'), btnImport: $('btnImport'), importInput: $('importInput'),
       history: $('history'), toast: $('toast')
     };
@@ -87,6 +92,7 @@
     buildRagSections();
     readUrlState();
     initRag();
+    initCards();
 
     if (state.query) {
       el.q.value = state.query;
@@ -279,6 +285,7 @@
       else if (act === 'share') share(part);
       else if (act === 'copy') copyText(part.part, 'Part number copied');
       else if (act === 'rag') openInRag(part);
+      else if (act === 'card') openCard(part.part);
     });
 
     el.didYouMean.addEventListener('click', function (e) {
@@ -330,6 +337,24 @@
     el.ragPart.addEventListener('change', function () {
       state.rag.part = el.ragPart.value;
       if (el.ragQ.value.trim()) runRagSearch();
+    });
+
+    el.btnCardSearch.addEventListener('click', function () { loadCards(true); });
+    el.cardQ.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') loadCards(true);
+    });
+    el.cardPkg.addEventListener('change', function () { loadCards(true); });
+    el.cardMfr.addEventListener('change', function () { loadCards(true); });
+    el.btnCardMore.addEventListener('click', function () { loadCards(false); });
+    el.cardGrid.addEventListener('click', function (e) {
+      var card = e.target.closest('[data-card]');
+      if (card) openCard(card.dataset.card);
+    });
+    el.cardModal.addEventListener('click', function (e) {
+      if (e.target.closest('[data-close]')) closeCard();
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && !el.cardModal.classList.contains('hidden')) closeCard();
     });
 
     el.btnImport.addEventListener('click', function () { el.importInput.click(); });
@@ -502,6 +527,7 @@
       '</ul></div>' +
       '<div class="d-actions">' +
         '<button class="btn btn-primary" data-act="rag">Search datasheet</button>' +
+        '<button class="btn" data-act="card">Open card</button>' +
         '<button class="btn" data-act="pdf">Datasheet (PDF)</button>' +
         '<button class="btn" data-act="search">Browser Search</button>' +
         '<button class="btn" data-act="share">Share</button>' +
@@ -1038,6 +1064,225 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     });
+  }
+
+
+  /* --------------------------------------------------------------- cards */
+
+  function cardUnavailable(msg) {
+    state.cards.ready = false;
+    el.cardStatus.textContent = msg;
+    el.cardHelp.classList.remove('hidden');
+  }
+
+  function initCards() {
+    if (typeof fetch !== 'function') {
+      cardUnavailable('This browser has no fetch() — cards need the HTTP API');
+      return;
+    }
+    apiGet('/api/cards/stats').then(function (st) {
+      state.cards.ready = (st.cards || 0) > 0;
+      fillFacets('cardPkg', (st.facets && st.facets.packages) || [], 'All packages');
+      fillFacets('cardMfr', (st.facets && st.facets.manufacturers) || [], 'All manufacturers');
+      if (!state.cards.ready) {
+        cardUnavailable('No cards extracted yet — ' + (st.cards || 0) + ' in the database');
+        return;
+      }
+      el.cardHelp.classList.add('hidden');
+      loadCards(true);
+    }).catch(function () {
+      cardUnavailable('Card database unavailable — see the instructions below');
+    });
+  }
+
+  function fillFacets(id, items, allLabel) {
+    var sel = el[id];
+    if (!sel) return;
+    sel.innerHTML = '<option value="">' + esc(allLabel) + '</option>' +
+      items.map(function (f) {
+        return '<option value="' + esc(f.name) + '">' + esc(f.name) +
+               ' (' + f.count + ')</option>';
+      }).join('');
+  }
+
+  function loadCards(reset) {
+    var c = state.cards;
+    if (c.busy) return;
+    c.busy = true;
+    if (reset) {
+      c.offset = 0;
+      el.cardGrid.innerHTML = '<div class="rag-loading">Loading…</div>';
+    }
+    c.q = el.cardQ.value.trim();
+    c.pkg = el.cardPkg.value;
+    c.mfr = el.cardMfr.value;
+
+    var url = '/api/cards?limit=' + c.limit + '&offset=' + c.offset +
+      (c.q ? '&q=' + encodeURIComponent(c.q) : '') +
+      (c.pkg ? '&pkg=' + encodeURIComponent(c.pkg) : '') +
+      (c.mfr ? '&mfr=' + encodeURIComponent(c.mfr) : '');
+
+    apiGet(url).then(function (data) {
+      c.busy = false;
+      c.total = data.total || 0;
+      var items = data.results || [];
+      renderCards(items, reset);
+      c.offset = (data.offset || 0) + items.length;
+      el.btnCardMore.hidden = c.offset >= c.total;
+      el.cardStatus.innerHTML = c.total
+        ? 'Cards: <b>' + c.total + '</b> shown ' + Math.min(c.offset, c.total) +
+          (c.q ? ' · query “' + esc(c.q) + '”' : '') +
+          (c.pkg ? ' · ' + esc(c.pkg) : '') + (c.mfr ? ' · ' + esc(c.mfr) : '')
+        : 'No cards match the filters';
+    }).catch(function (err) {
+      c.busy = false;
+      el.cardGrid.innerHTML = '';
+      el.cardStatus.textContent = 'Card search failed: ' + err.message;
+    });
+  }
+
+  function renderCards(items, reset) {
+    if (!items.length && reset) {
+      el.cardGrid.innerHTML = '<div class="rag-none">Nothing found. Try a shorter query.</div>';
+      return;
+    }
+    var html = items.map(function (c) {
+      var cls = c.confidence >= 0.8 ? 'good' : c.confidence >= 0.5 ? 'mid' : 'low';
+      var specs = (c.headline || []).slice(0, 4).map(function (h) {
+        return '<span class="spec-chip">' + esc(h.label) + ' <b>' + esc(h.text) + '</b></span>';
+      }).join('');
+      return '<article class="pcard" data-card="' + esc(c.part) + '">' +
+        '<div class="pcard-head">' +
+          '<span class="pcard-part">' + esc(c.part) + '</span>' +
+          '<span class="pcard-mfr">' + esc(c.manufacturer || 'manufacturer unknown') + '</span>' +
+          '<span class="pcard-badge ' + cls + '">' +
+            Math.round((c.confidence || 0) * 100) + '% extracted</span>' +
+        '</div>' +
+        '<div class="pcard-chips">' +
+          (c.package ? '<span class="pcard-chip">' + esc(c.package) + '</span>' : '') +
+          (c.pin_count ? '<span class="pcard-chip">' + c.pin_count + ' pins</span>' : '') +
+          (c.family ? '<span class="pcard-chip">' + esc(c.family) + '</span>' : '') +
+          (c.pages ? '<span class="pcard-chip">' + c.pages + ' pages</span>' : '') +
+        '</div>' +
+        (c.description ? '<div class="pcard-desc">' + esc(c.description) + '</div>' : '') +
+        (specs ? '<div class="pcard-specs">' + specs + '</div>' : '') +
+        '<div class="pcard-foot">' + esc(c.filename || '') + '</div>' +
+      '</article>';
+    }).join('');
+    el.cardGrid.innerHTML = reset ? html : el.cardGrid.innerHTML + html;
+  }
+
+  function openCard(part) {
+    if (!part) return;
+    if (typeof fetch !== 'function') { toast('Cards need the HTTP API'); return; }
+    apiGet('/api/card?part=' + encodeURIComponent(part)).then(function (card) {
+      el.cardModalBody.innerHTML = renderCardFull(card);
+      el.cardModal.classList.remove('hidden');
+    }).catch(function (err) {
+      toast(err && err.message === 'HTTP 404'
+        ? 'No card in the datasheet library for ' + part
+        : 'Could not load the card: ' + err.message);
+    });
+  }
+
+  function closeCard() {
+    el.cardModal.classList.add('hidden');
+  }
+
+  function renderCardFull(c) {
+    var out = '';
+    out += '<div class="card-full-head">' +
+      '<span class="card-full-part">' + esc(c.part) + '</span>' +
+      '<span class="pcard-mfr">' + esc(c.manufacturer || 'manufacturer unknown') + '</span>' +
+      (c.package ? '<span class="pcard-chip">' + esc(c.package) + '</span>' : '') +
+      (c.family ? '<span class="pcard-chip">' + esc(c.family) + '</span>' : '') +
+      '<span class="pcard-badge ' + (c.confidence >= 0.8 ? 'good' : c.confidence >= 0.5 ? 'mid' : 'low') +
+        '">' + Math.round((c.confidence || 0) * 100) + '% extracted</span>' +
+    '</div>';
+
+    if (c.description) out += '<div class="pcard-desc" style="font-size:14px">' + esc(c.description) + '</div>';
+
+    if ((c.headline || []).length) {
+      out += '<div class="card-section"><h4>Key parameters</h4><div class="pcard-specs">' +
+        c.headline.map(function (h) {
+          return '<span class="spec-chip">' + esc(h.label) + ' <b>' + esc(h.text) + '</b>' +
+                 (h.page ? ' <span class="src">p.' + h.page + '</span>' : '') + '</span>';
+        }).join('') + '</div></div>';
+    }
+
+    if ((c.pins || []).length) {
+      out += '<div class="card-section"><h4>Pin configuration (' + c.pins.length + ')</h4>' +
+        '<div class="pcard-pins">' + c.pins.map(function (p) {
+          var title = [p.name, p.function].filter(Boolean).join(' — ');
+          return '<span class="pin-pill" title="' + esc(title) + '"><b>' + esc(p.n) + '</b> ' +
+                 esc(p.name || '') + '</span>';
+        }).join('') + '</div></div>';
+    }
+
+    out += specTable('Absolute maximum ratings', c.ratings, ['Symbol', 'Parameter', 'Value', 'Page'],
+      function (r) {
+        return '<td class="mono">' + esc(r.symbol) + '</td><td>' + esc(r.param) +
+               '</td><td class="num">' + esc(r.text) + '</td><td class="src">' + (r.page || '') + '</td>';
+      });
+
+    out += specTable('Electrical characteristics', c.specs,
+      ['Symbol', 'Parameter', 'Conditions', 'Min', 'Typ', 'Max', 'Unit', 'Page'],
+      function (r) {
+        return '<td class="mono">' + esc(r.symbol) + '</td><td>' + esc(r.param) +
+               '</td><td class="src">' + esc(r.conditions || '') +
+               '</td><td class="num">' + esc(r.min || '') + '</td><td class="num">' + esc(r.typ || '') +
+               '</td><td class="num">' + esc(r.max || '') + '</td>' +
+               '<td class="src">' + esc(r.unit || '') + '</td>' +
+               '<td class="src">' + (r.page || '') + '</td>';
+      });
+
+    if ((c.features || []).length) {
+      out += '<div class="card-section"><h4>Features</h4><ul class="card-list">' +
+        c.features.map(function (f) { return '<li>' + esc(f) + '</li>'; }).join('') + '</ul></div>';
+    }
+    if ((c.applications || []).length) {
+      out += '<div class="card-section"><h4>Applications</h4><ul class="card-list">' +
+        c.applications.map(function (f) { return '<li>' + esc(f) + '</li>'; }).join('') + '</ul></div>';
+    }
+
+    var dims = c.dimensions || {};
+    var dimKeys = Object.keys(dims);
+    if (dimKeys.length) {
+      out += '<div class="card-section"><h4>Package dimensions</h4><div class="card-dims">' +
+        dimKeys.map(function (k) {
+          var d = dims[k];
+          return '<span class="pcard-chip">' + esc(k.replace(/_/g, ' ')) + ': <b>' +
+                 d.value + ' ' + esc(d.unit) + '</b></span>';
+        }).join('') + '</div></div>';
+    }
+
+    if ((c.order_codes || []).length) {
+      out += '<div class="card-section"><h4>Order codes and markings</h4><div class="pcard-pins">' +
+        c.order_codes.map(function (o) {
+          return '<span class="pin-pill"><b>' + esc(o.code) + '</b>' +
+                 (o.package ? ' ' + esc(o.package) : '') +
+                 (o.marking ? ' · ' + esc(o.marking) : '') + '</span>';
+        }).join('') + '</div></div>';
+    }
+
+    out += '<div class="card-section"><h4>Source</h4><div class="pcard-foot">' +
+      esc(c.filename || '') + ' · ' + (c.pages || 0) + ' pages · ' + (c.tables || 0) +
+      ' tables · parsed by ' + esc(c.parser || '?') +
+      (c.filename ? ' <a class="rag-pdf" href="/pdfs/' + encodeURIComponent(c.filename) +
+        '" target="_blank" rel="noopener">Open PDF</a>' : '') +
+      '</div></div>';
+
+    return out;
+
+    function specTable(title, rows, headers, rowFn) {
+      if (!rows || !rows.length) return '';
+      return '<div class="card-section"><h4>' + title + ' (' + rows.length + ')</h4>' +
+        '<table class="card-table"><thead><tr>' +
+        headers.map(function (h) { return '<th>' + esc(h) + '</th>'; }).join('') +
+        '</tr></thead><tbody>' +
+        rows.map(function (r) { return '<tr>' + rowFn(r) + '</tr>'; }).join('') +
+        '</tbody></table></div>';
+    }
   }
 
   /* ------------------------------------------------------------------ boot */

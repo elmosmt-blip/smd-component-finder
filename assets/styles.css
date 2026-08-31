@@ -400,3 +400,83 @@ code { font-family: var(--mono); font-size: 0.92em; }
   background: var(--bg-input); border: 1px solid var(--line-soft); border-radius: 6px;
   padding: 10px 12px; overflow-x: auto; font-size: 12.5px; color: var(--text); margin: 8px 0;
 }
+
+/* -------------------------------------------------------------- cards UI */
+
+.cards-controls { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+.cards-controls #cardQ { flex: 1 1 260px; }
+.cards-more { display: flex; justify-content: center; margin-top: 16px; }
+
+.cards-grid {
+  display: grid; gap: 14px; margin-top: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+}
+.pcard {
+  background: var(--bg-elev); border: 1px solid var(--line-soft);
+  border-radius: var(--radius); padding: 14px 16px; cursor: pointer;
+  display: flex; flex-direction: column; gap: 10px;
+  transition: border-color .15s, transform .15s;
+}
+.pcard:hover { border-color: var(--accent); transform: translateY(-2px); }
+.pcard-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.pcard-part { font-family: var(--mono); font-size: 19px; font-weight: 600; color: var(--accent); }
+.pcard-mfr { font-size: 12.5px; color: var(--text-dim); }
+.pcard-badge {
+  margin-left: auto; font-size: 11px; padding: 2px 7px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--text-faint); white-space: nowrap;
+}
+.pcard-badge.good { color: var(--green); border-color: rgba(52, 211, 153, .4); }
+.pcard-badge.mid  { color: var(--amber); border-color: rgba(251, 191, 36, .4); }
+.pcard-badge.low  { color: var(--red);   border-color: rgba(248, 113, 113, .4); }
+.pcard-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.pcard-chip {
+  font-size: 11.5px; font-family: var(--mono); padding: 2px 7px; border-radius: 5px;
+  background: var(--bg-panel); border: 1px solid var(--line); color: var(--text-dim);
+}
+.pcard-desc { font-size: 13px; color: var(--text-dim); line-height: 1.5; }
+.pcard-specs { display: flex; gap: 6px; flex-wrap: wrap; }
+.spec-chip {
+  font-size: 11.5px; padding: 3px 8px; border-radius: 5px;
+  background: rgba(34, 211, 238, .08); border: 1px solid rgba(34, 211, 238, .22);
+  color: var(--text);
+}
+.spec-chip b { color: var(--accent); font-weight: 600; }
+.pcard-pins { display: flex; gap: 5px; flex-wrap: wrap; }
+.pin-pill {
+  font-family: var(--mono); font-size: 11.5px; padding: 2px 7px; border-radius: 5px;
+  background: var(--bg-input); border: 1px solid var(--line-soft); color: var(--text-dim);
+}
+.pin-pill b { color: var(--text); }
+.pcard-foot { font-size: 11.5px; color: var(--text-faint); display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* modal */
+.modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; }
+.modal.hidden { display: none; }
+.modal-back { position: absolute; inset: 0; background: rgba(0, 0, 0, .66); }
+.modal-box {
+  position: relative; z-index: 1; width: min(860px, 94vw); max-height: 88vh; overflow: auto;
+  background: var(--bg-panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 22px 24px; box-shadow: 0 24px 60px rgba(0, 0, 0, .5);
+}
+.modal-x {
+  position: absolute; top: 10px; right: 12px; background: none; border: none;
+  color: var(--text-faint); font-size: 24px; line-height: 1; cursor: pointer;
+}
+.modal-x:hover { color: var(--text); }
+.card-full-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+.card-full-part { font-family: var(--mono); font-size: 26px; font-weight: 600; color: var(--accent); }
+.card-section { margin-top: 18px; }
+.card-section h4 {
+  margin: 0 0 8px; font-size: 13px; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--text-faint);
+}
+.card-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.card-table th, .card-table td {
+  text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line-soft);
+}
+.card-table th { color: var(--text-faint); font-weight: 500; font-size: 12px; }
+.card-table td.mono { font-family: var(--mono); color: var(--text); }
+.card-table td.num { font-family: var(--mono); text-align: right; white-space: nowrap; }
+.card-list { margin: 0; padding-left: 18px; font-size: 13px; color: var(--text-dim); line-height: 1.6; }
+.card-dims { display: flex; gap: 8px; flex-wrap: wrap; }
+.src { color: var(--text-faint); font-size: 11.5px; }
