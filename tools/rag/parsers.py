@@ -81,6 +81,30 @@ class DoclingParser(BaseParser):
             ) from exc
         return True
 
+    @staticmethod
+    def _fill_tables(path: Path, pages: List["Page"]) -> None:
+        """Attach pdfplumber tables to Docling pages, by page number."""
+        try:
+            import pdfplumber
+            with pdfplumber.open(str(path)) as pdf:
+                for page in pages:
+                    idx = page.number - 1
+                    if not (0 <= idx < len(pdf.pages)):
+                        continue
+                    raw = pdf.pages[idx].extract_tables() or []
+                    tables = []
+                    for t in raw:
+                        cleaned = [
+                            [clean_text((cell or "")).strip() for cell in row]
+                            for row in t
+                            if row and any((cell or "").strip() for cell in row)
+                        ]
+                        if cleaned:
+                            tables.append(cleaned)
+                    page.tables = tables
+        except Exception:                      # noqa: BLE001 - tables are a bonus
+            return
+
     def parse(self, path: Path) -> ParsedDoc:
         self.is_available()
         try:
@@ -113,6 +137,12 @@ class DoclingParser(BaseParser):
             pages = []
         if not pages:
             pages = [Page(number=1, text=markdown)]
+
+        # Docling's markdown is excellent for retrieval but carries no per-page
+        # table objects, and the card extractor works from tables. Without this
+        # a Docling run would produce beautiful chunks and empty cards, so the
+        # tables are filled in with pdfplumber (offline, no model weights).
+        self._fill_tables(path, pages)
 
         return ParsedDoc(
             doc_id=_doc_id(path),
@@ -287,8 +317,11 @@ def get_parser(preferred: str = "auto") -> BaseParser:
     With 'auto' we try Docling first and silently fall back, because a parser
     that cannot download its models is worse than a weaker parser that works.
     """
+    # Asking for Docling and quietly getting something else is worse than an
+    # error: the user would trust results produced by another engine. Only
+    # 'auto' is allowed to substitute, and it reports what it did.
     order = {
-        "docling": ["docling", "pdfplumber"],
+        "docling": ["docling"],
         "pdfplumber": ["pdfplumber"],
         "auto": ["docling", "pdfplumber"],
     }[preferred]
@@ -298,7 +331,8 @@ def get_parser(preferred: str = "auto") -> BaseParser:
         parser: BaseParser = DoclingParser() if name == "docling" else PdfPlumberParser()
         try:
             parser.is_available()
+            parser.fallback_errors = errors          # why the others were skipped
             return parser
         except ParserUnavailable as exc:
-            errors.append(str(exc))
+            errors.append("%s: %s" % (name, exc))
     raise ParserUnavailable("No PDF parser available. " + " | ".join(errors))

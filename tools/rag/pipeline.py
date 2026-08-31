@@ -44,6 +44,9 @@ def build(corpus: Path, out: Path, parser_name: str = "auto", embed: str = "none
 
     parser = parsers.get_parser(parser_name)
     print("Parser:      %s" % parser.name)
+    for reason in getattr(parser, "fallback_errors", []) or []:
+        print("             (skipped %s)" % reason.split(":")[0] +
+              " — " + reason.split("Original error:")[-1].strip()[:90])
     print("Embeddings:  %s" % backend.describe())
 
     pdfs = sorted(corpus.glob("*.pdf"))

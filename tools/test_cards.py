@@ -107,6 +107,35 @@ def main() -> int:
               a["key_specs"].get("input_voltage", {}).get("value") == 15.0,
               str(a["key_specs"].get("input_voltage")))
 
+    print("\n--- парсеры ---")
+    from tools.rag import parsers as P
+    try:
+        import docling            # noqa: F401
+        docling_installed = True
+    except ImportError:
+        docling_installed = False
+    if not docling_installed:
+        try:
+            P.get_parser("docling")
+            check("явный запрос Docling не подменяется молча", False, "парсер подменился")
+        except P.ParserUnavailable:
+            check("явный запрос Docling не подменяется молча", True)
+        auto = P.get_parser("auto")
+        check("auto тихо падает на pdfplumber", auto.name == "pdfplumber", auto.name)
+        check("auto помнит, почему пропустил Docling",
+              any("docling" in e.lower() for e in getattr(auto, "fallback_errors", [])),
+              str(getattr(auto, "fallback_errors", []))[:80])
+
+    # Docling сам не отдаёт таблицы по страницам, а карточки строятся из таблиц
+    pages = [P.Page(number=1, text=""), P.Page(number=2, text="")]
+    P.DoclingParser._fill_tables(corpus / "MMBT3904_datasheet.pdf", pages)
+    check("гибрид Docling+pdfplumber достаёт таблицы",
+          len(pages[0].tables) >= 1 and len(pages[1].tables) >= 1,
+          "%d/%d" % (len(pages[0].tables), len(pages[1].tables)))
+    check("в таблицах есть шапка",
+          pages[0].tables and pages[0].tables[0][0][0] == "Pin",
+          str(pages[0].tables[0][0] if pages[0].tables else ""))
+
     print("\n--- база карточек ---")
     store = card_store.CardStore(out / "cards.db")
     for card in cards.values():
