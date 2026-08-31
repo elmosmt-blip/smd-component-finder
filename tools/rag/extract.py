@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from tools.rag import metadata
 
@@ -307,12 +307,49 @@ def _norm_header(cell: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (cell or "").lower()).strip()
 
 
-def classify_table(table: List[List[str]]) -> Optional[Tuple[str, Dict[str, int]]]:
-    """Return (kind, {column_name: index}) if the header row is recognised."""
+def merge_header(table: List[List[str]]) -> Tuple[List[str], int]:
+    """Join a two-row header into one, and say how many rows it ate.
+
+    Vendors love stacked headers:
+
+        ['PIN', '',       'TYPE', 'DESCRIPTION']
+        ['NO.', 'NAME',   '',     '']
+
+    Reading only the first row makes DESCRIPTION look like the name column,
+    and the pin name ends up being a paragraph of prose. Merging gives
+    ['PIN NO.', 'NAME', 'TYPE', 'DESCRIPTION'] and everything falls into place.
+    """
+    if not table:
+        return [], 0
+    width = max(len(r) for r in table[:2])
+    merged: List[str] = []
+    for i in range(width):
+        parts = []
+        for row in table[:2]:
+            cell = _norm_header(row[i]) if i < len(row) else ""
+            if cell:
+                parts.append(cell)
+        merged.append(" ".join(parts))
+
+    rows_used = 1
+    second = table[1] if len(table) > 1 else None
+    if second is not None and not any(re.search(r"\d", c or "") for c in second):
+        # a row without a single digit is a continuation of the header, not data
+        rows_used = 2
+    return merged, rows_used
+
+
+def classify_table(table: List[List[str]]) -> Optional[Tuple[str, Dict[str, int], int]]:
+    """Return (kind, {column_name: index}, header_rows) if the header is recognised."""
     if not table or len(table) < 2:
         return None
-    for header in table[:2]:
-        cells = [_norm_header(c) for c in header]
+    candidates = []
+    merged, rows_used = merge_header(table)
+    if sum(1 for c in merged if c) >= 2:
+        candidates.append((merged, rows_used))
+    candidates.append(([_norm_header(c) for c in table[0]], 1))
+
+    for cells, rows_used in candidates:
         if sum(1 for c in cells if c) < 2:
             continue
         joined = " ".join(cells)
@@ -349,7 +386,7 @@ def classify_table(table: List[List[str]]) -> Optional[Tuple[str, Dict[str, int]
                 continue
             if kind in ("ratings", "electrical") and "symbol" not in cols:
                 continue
-            return kind, cols
+            return kind, cols, rows_used
     return None
 
 
@@ -518,33 +555,91 @@ def _looks_heading(line: str) -> bool:
     return _looks_like_heading(line)
 
 
+_JUNK_START = re.compile(
+    r"^(note|figure|fig\.|table|tab\.|see|refer|www\.|http|copyright|\d+\.|"
+    r"[a-e]\.|\(|\[|pin |package |ordering |revision )", re.I)
+
+
+def _looks_like_prose(line: str) -> bool:
+    """Reject the fragments that a real datasheet page is full of.
+
+    A description is a sentence about the part. Pin-tables squeezed by the PDF
+    extractor ("OnlytheGPIOfunctionisshownonGPIOterminals"), footnotes
+    ("Note 1: UART1 has assigned pins") and continuation lines ("...even if
+    the clock is not running") are not.
+    """
+    if len(line) < 60 or len(line) > 600:
+        return False
+    words = line.split()
+    if len(words) < 9:
+        return False
+    if _JUNK_START.match(line):
+        return False
+    if re.match(r"^[A-Z]{2,}\d*/", line):          # "PGED3/RP11/RB5" — a pin mux label
+        return False
+    if re.search(r"\b(Legend|Shaded|Note\s*\d+)\b", line, re.I):   # figure captions
+        return False
+    if not line[0].isupper():
+        return False
+    letters = sum(c.isalpha() for c in line)
+    if letters < len(line) * 0.55:        # mostly digits/symbols — a table row
+        return False
+    longest = max(len(w) for w in words)
+    if longest > 28:                      # words glued together by the extractor
+        return False
+    # The text layer wraps paragraphs mid-sentence, so a line rarely ends on a
+    # period: requiring one *inside* the line is enough to call it prose.
+    if not re.search(r"[.!?](\s|$)", line):
+        return False
+    return True
+
+
+def _paragraphs(pages: List[Any], max_pages: int = 2) -> Iterator[Tuple[int, str]]:
+    """Rebuild paragraphs: the text layer wraps mid-sentence, so a paragraph
+    only makes sense once its lines are glued back together."""
+    buf: List[str] = []
+    start = 1
+    for page in pages[:max_pages]:
+        for raw in (page.text or "").splitlines():
+            line = _clean(raw)
+            if not line or _looks_heading(line) or len(line) < 25:
+                if buf:
+                    yield start, " ".join(buf)
+                    buf = []
+                continue
+            if not buf:
+                start = page.number
+            buf.append(line)
+        if buf:
+            yield start, " ".join(buf)
+            buf = []
+
+
 def extract_description(pages: List[Any], fallback_text: str) -> Tuple[str, int]:
-    lines = section_lines(pages, "description")
-    if not lines:
-        # no heading: take the first prose paragraph of the document
-        buf: List[str] = []
-        for page in pages:
-            for raw in (page.text or "").splitlines():
-                line = _clean(raw)
-                if len(line) < 40:
-                    if buf:
-                        break
-                    continue
-                if re.search(r"[.]$", line) and len(line) > 60:
-                    buf.append(line)
-                    return _clean(" ".join(buf)), page.number
-        return _clean(fallback_text[:300]), 1
-    text = " ".join(l for _, l in lines)
-    # keep the first two sentences
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    return _clean(" ".join(parts[:2]))[:400], lines[0][0]
+    """Prefer the section that says it is the description; else the first real
+    paragraph on the first pages; else nothing at all."""
+    section = section_lines(pages, "description")
+    if section:
+        text = _clean(" ".join(l for _, l in section))
+        if _looks_like_prose(text[:600]):
+            sentences = re.split(r"(?<=[.!?])\s+", text)
+            return _clean(" ".join(sentences[:2]))[:400], section[0][0]
+
+    for page_no, para in _paragraphs(pages):
+        if _looks_like_prose(para[:600]):
+            sentences = re.split(r"(?<=[.!?])\s+", para)
+            return _clean(" ".join(sentences[:2]))[:400], page_no
+
+    # A wrong description is worse than an empty one: the card would then look
+    # authoritative about something it merely guessed.
+    return "", 1
 
 
 def extract_bullets(pages: List[Any], key: str, limit: int = 10) -> Tuple[List[str], int]:
     lines = section_lines(pages, key)
     out: List[str] = []
     page = lines[0][0] if lines else 1
-    for pg, line in lines:
+    for pg, line in (lines or [(1, p) for _, p in _paragraphs(pages, 1)]):
         text = _BULLET.sub("", line).strip(" :-")
         if len(text) < 4 or len(text) > 160:
             continue
@@ -561,33 +656,40 @@ def extract_bullets(pages: List[Any], key: str, limit: int = 10) -> Tuple[List[s
 # ---------------------------------------------------------------------------
 
 def extract_pins(pages: List[Any]) -> Tuple[List[dict], Optional[int]]:
+    best: List[dict] = []
+    best_page: Optional[int] = None
     for page in pages:
         for table in page.tables:
             kind = classify_table(table)
             if not kind or kind[0] != "pins":
                 continue
-            _, cols = kind
+            _, cols, header_rows = kind
             pins: List[dict] = []
-            for row in table[1:]:
+            for row in table[header_rows:]:
                 if not row or not any(c for c in row):
                     continue
                 num = row[cols["pin"]] if "pin" in cols and cols["pin"] < len(row) else ""
                 if not re.search(r"\d", num or ""):
                     continue
-                name = row[cols["param"]] if "param" in cols and cols["param"] < len(row) else ""
+                name = _clean(row[cols["param"]]) if "param" in cols and cols["param"] < len(row) else ""
+                if len(name) > 60:
+                    # a pin NAME is "HB", not a paragraph: this column is prose
+                    name = ""
                 func = ""
-                for key in ("conditions", "value"):
+                for key in ("conditions", "value", "unit"):
                     if key in cols and cols[key] < len(row):
                         func = row[cols[key]] or ""
                         break
                 pins.append({
                     "n": _clean(num).split()[0].strip("."),
-                    "name": _clean(name),
+                    "name": name,
                     "function": _clean(func)[:80],
                 })
-            if pins:
-                return pins, page.number
-    return [], None
+            named = sum(1 for x in pins if x["name"])
+            # A table where almost nothing has a name is a misread, not a pinout.
+            if pins and named >= max(2, len(pins) // 2) and len(pins) > len(best):
+                best, best_page = pins, page.number
+    return best, best_page
 
 
 def _rows_from(pages: List[Any], kind_wanted: str) -> List[Tuple[int, dict, List[str]]]:
@@ -596,8 +698,8 @@ def _rows_from(pages: List[Any], kind_wanted: str) -> List[Tuple[int, dict, List
             kind = classify_table(table)
             if not kind or kind[0] != kind_wanted:
                 continue
-            _, cols = kind
-            for row in table[1:]:
+            _, cols, header_rows = kind
+            for row in table[header_rows:]:
                 if not row or not any(c for c in row):
                     continue
                 yield page.number, cols, row
