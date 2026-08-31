@@ -213,6 +213,7 @@ def print_stats(out: Path) -> None:
     print("  with pins:      %d" % s["with_pins"])
     print("  with mfr:       %d" % s["with_manufacturer"])
     print("  with ratings:   %d" % s["with_ratings"])
+    print("  with ratings:   %d" % s["with_ratings"])
     print("  avg confidence: %.2f" % s["avg_confidence"])
     print("  failures:       %d" % s["failures"])
     facets = store.facets()
