@@ -316,12 +316,129 @@ def read_list(path: Path, vendor: str = "", parts_file: Optional[Path] = None
     return rows
 
 
+# ------------------------------------------------------- open parts catalogs
+
+# Column names as they appear in the open JLCPCB/LCSC catalogue
+# (https://yaqwsx.github.io/jlcparts/ — a downloadable SQLite, several million
+# SMD parts with datasheet links). Matched loosely: the schema has changed
+# before and will change again, so the exporter introspects the file instead
+# of trusting a fixed layout.
+JLC_PART_COLUMNS = ("mfr", "part", "mpn", "part_number")
+JLC_PACKAGE_COLUMNS = ("package", "footprint")
+JLC_URL_COLUMNS = ("datasheet", "url", "datasheet_url")
+
+
+def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "parts",
+                       basic_only: bool = False, min_stock: int = 0,
+                       category: str = "", limit: int = 0,
+                       verbose: bool = False) -> int:
+    """Turn a parts database (jlcparts and friends) into a part list CSV.
+
+    Nothing here assumes a schema: columns are found by name, and if the file
+    does not look like a parts catalogue the available columns are printed so
+    you can map them yourself with a `--list` CSV of your own.
+    """
+    import sqlite3
+
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    try:
+        tables = [r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")]
+        if table not in tables:
+            candidates = [t for t in tables if t.endswith("parts")] or tables[:5]
+            raise SystemExit("no table %r in %s; available: %s"
+                             % (table, db_path.name, ", ".join(tables[:12])))
+        cols = [r[1] for r in con.execute("PRAGMA table_info(%s)" % table)]
+
+        def pick(options: Iterable[str]) -> str:
+            for name in options:
+                if name in cols:
+                    return name
+            return ""
+
+        part_col = pick(JLC_PART_COLUMNS)
+        pkg_col = pick(JLC_PACKAGE_COLUMNS)
+        url_col = pick(JLC_URL_COLUMNS)
+        if not part_col or not url_col:
+            raise SystemExit(
+                "cannot map %s: need a part-number column %s and a datasheet "
+                "column %s; the file has: %s"
+                % (db_path.name, list(JLC_PART_COLUMNS), list(JLC_URL_COLUMNS),
+                   ", ".join(cols)))
+
+        mfr_col = pick(("manufacturer", "manufacturer_name", "brand"))
+        mfr_join = ""
+        if not mfr_col and "manufacturer_id" in cols and "manufacturers" in tables:
+            mfr_join = (" LEFT JOIN manufacturers mn ON mn.id = p.manufacturer_id")
+            mfr_col = "mn.name"
+        lcsc_col = pick(("lcsc", "lcsc_part", "id"))
+
+        where, args = [], []
+        if url_col:
+            where.append("TRIM(COALESCE(p.%s, '')) != ''" % url_col)
+        if basic_only and "basic" in cols:
+            where.append("p.basic = 1")
+        if min_stock and "stock" in cols:
+            where.append("COALESCE(p.stock, 0) >= ?"); args.append(min_stock)
+        if category:
+            like = "%%%s%%" % category
+            if "category_id" in cols and "categories" in tables:
+                # Parentheses matter: AND binds tighter than OR, so without
+                # them the datasheet filter silently stops applying as soon
+                # as a category is requested.
+                where.append("(COALESCE(c.category, '') LIKE ? "
+                             "OR COALESCE(c.subcategory, '') LIKE ?)")
+                args += [like, like]
+                mfr_join += (" LEFT JOIN categories c ON c.id = p.category_id")
+            else:
+                print("warning: no categories table, --category ignored")
+
+        select = ["p.%s AS part" % part_col]
+        if mfr_col:
+            select.append("%s AS manufacturer" % mfr_col)
+        else:
+            select.append("'' AS manufacturer")
+        select.append("COALESCE(p.%s, '') AS package" % pkg_col if pkg_col
+                      else "'' AS package")
+        select.append("p.%s AS url" % url_col)
+        if lcsc_col and lcsc_col != part_col:
+            select.append("p.%s AS lcsc" % lcsc_col)
+
+        sql = ("SELECT DISTINCT %s FROM %s p%s %s %s"
+               % (", ".join(select), table, mfr_join,
+                  ("WHERE " + " AND ".join(where)) if where else "",
+                  "LIMIT %d" % limit if limit else ""))
+        rows = con.execute(sql, args).fetchall()
+    finally:
+        con.close()
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["part", "manufacturer", "package", "url"])
+        for row in rows:
+            writer.writerow([row["part"] or "", row["manufacturer"] or "",
+                             row["package"] or "", row["url"] or ""])
+    if verbose:
+        print("Exported %d parts -> %s" % (len(rows), out_csv))
+    return len(rows)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Download datasheet PDFs into the corpus")
     ap.add_argument("--list", type=Path, help="CSV/JSON part list: part,manufacturer,package,url")
     ap.add_argument("--parts", type=Path, help="plain text file, one part number per line")
     ap.add_argument("--vendor", choices=sorted(VENDOR_PATTERNS),
                     help="build URLs from the part number (use with --parts)")
+    ap.add_argument("--from-jlcparts", type=Path, metavar="CACHE.SQLITE3",
+                    help="export a part list from the open JLCPCB/LCSC catalog")
+    ap.add_argument("--to-csv", type=Path, metavar="PARTS.CSV",
+                    help="where to write the exported list (default: parts.csv)")
+    ap.add_argument("--basic-only", action="store_true",
+                    help="JLCPCB basic/preferred parts only")
+    ap.add_argument("--min-stock", type=int, default=0)
+    ap.add_argument("--category", default="", help="substring of the category name")
     ap.add_argument("--out", type=Path, default=Path("data/datasheets"))
     ap.add_argument("--delay", type=float, default=1.0, help="seconds between requests, per host")
     ap.add_argument("--retries", type=int, default=3)
@@ -332,6 +449,20 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="print URLs, download nothing")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+
+    if args.from_jlcparts:
+        target = args.to_csv or Path("parts.csv")
+        if not args.from_jlcparts.exists():
+            print("No such file: %s" % args.from_jlcparts)
+            print("Download cache.sqlite3 from https://yaqwsx.github.io/jlcparts/")
+            return 2
+        n = export_from_sqlite(args.from_jlcparts, target,
+                               basic_only=args.basic_only,
+                               min_stock=args.min_stock, category=args.category,
+                               limit=args.limit, verbose=True)
+        print("Next: python3 tools/rag/fetch_datasheets.py --list %s "
+              "--out %s --dry-run" % (target, args.out))
+        return 0 if n else 1
 
     if not args.list and not args.parts:
         print("Give me a part list: --list parts.csv or --parts parts.txt [--vendor st]")

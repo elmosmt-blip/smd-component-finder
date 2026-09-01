@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -236,6 +237,82 @@ def main() -> int:
               fd.vendor_of({"manufacturer": "Diodes Incorporated"}) == "diodes")
         check("неизвестный производитель — пусто",
               fd.vendor_of({"manufacturer": "Mystery Corp"}) == "")
+        print("\n--- экспорт списка из каталога JLCPCB/LCSC ---")
+        db = tmp / "cache.sqlite3"
+        con = sqlite3.connect(str(db))
+        con.executescript("""
+            CREATE TABLE manufacturers (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE categories (id INTEGER PRIMARY KEY, category TEXT, subcategory TEXT);
+            CREATE TABLE parts (
+                lcsc TEXT, mfr TEXT, package TEXT, joints INTEGER,
+                manufacturer_id INTEGER, category_id INTEGER,
+                basic INTEGER, description TEXT, datasheet TEXT, stock INTEGER);
+        """)
+        con.executemany("INSERT INTO manufacturers VALUES (?,?)",
+                        [(1, "onsemi"), (2, "Texas Instruments")])
+        con.executemany("INSERT INTO categories VALUES (?,?,?)",
+                        [(1, "Transistors", "Bipolar"), (2, "Power", "LDO")])
+        con.executemany(
+            "INSERT INTO parts VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [("C1", "MMBT3904", "SOT-23", 3, 1, 1, 1, "NPN", "https://x/MMBT3904.pdf", 500),
+             ("C2", "TPS7A05", "SOT-23-5", 5, 2, 2, 0, "LDO", "https://x/TPS7A05.pdf", 0),
+             ("C3", "NODATA", "SOT-23", 3, 1, 1, 1, "no link", "", 100)])
+        con.commit(); con.close()
+
+        exported = tmp / "parts_from_db.csv"
+        n = fd.export_from_sqlite(db, exported)
+        rows_e = fd.read_list(exported)
+        check("экспортировано столько, сколько со ссылками", n == 2, str(n))
+        check("колонки на месте", list(rows_e[0].keys())[:4] ==
+              ["part", "manufacturer", "package", "url"], str(list(rows_e[0].keys())))
+        check("производитель подтянут из отдельной таблицы",
+              {r["part"]: r["manufacturer"] for r in rows_e} ==
+              {"MMBT3904": "onsemi", "TPS7A05": "Texas Instruments"}, str(rows_e))
+        check("корпус и URL попали в CSV",
+              rows_e[0]["package"] == "SOT-23" and rows_e[0]["url"].endswith(".pdf"))
+
+        only_basic = tmp / "basic.csv"
+        fd.export_from_sqlite(db, only_basic, basic_only=True)
+        check("--basic-only отфильтровал",
+              [r["part"] for r in fd.read_list(only_basic)] == ["MMBT3904"],
+              str([r["part"] for r in fd.read_list(only_basic)]))
+
+        in_stock = tmp / "stock.csv"
+        fd.export_from_sqlite(db, in_stock, min_stock=1000)
+        check("--min-stock отфильтровал", len(fd.read_list(in_stock)) == 0)
+
+        by_cat = tmp / "cat.csv"
+        fd.export_from_sqlite(db, by_cat, category="Bipolar")
+        check("--category отфильтровал",
+              [r["part"] for r in fd.read_list(by_cat)] == ["MMBT3904"],
+              str([r["part"] for r in fd.read_list(by_cat)]))
+
+        print("\n--- база другой формы не ломает экспорт ---")
+        db2 = tmp / "other.sqlite3"
+        con = sqlite3.connect(str(db2))
+        con.executescript("""
+            CREATE TABLE parts (part_number TEXT, footprint TEXT, datasheet_url TEXT);
+            INSERT INTO parts VALUES ('NE555','SOIC-8','https://x/ne555.pdf');
+        """)
+        con.commit(); con.close()
+        out2 = tmp / "other.csv"
+        n2 = fd.export_from_sqlite(db2, out2)
+        check("альтернативные имена колонок понимаются", n2 == 1, str(n2))
+        check("корпус взят из footprint",
+              fd.read_list(out2)[0]["package"] == "SOIC-8",
+              str(fd.read_list(out2)[0]))
+
+        db3 = tmp / "broken.sqlite3"
+        con = sqlite3.connect(str(db3))
+        con.executescript("CREATE TABLE parts (foo TEXT, bar TEXT);")
+        con.commit(); con.close()
+        try:
+            fd.export_from_sqlite(db3, tmp / "never.csv")
+            check("непохожая схема — понятная ошибка", False, "исключения не было")
+        except SystemExit as exc:
+            check("непохожая схема — понятная ошибка",
+                  "cannot map" in str(exc), str(exc)[:60])
+
     finally:
         httpd.shutdown()
         httpd.server_close()

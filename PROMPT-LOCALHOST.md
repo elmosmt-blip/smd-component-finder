@@ -136,9 +136,17 @@ OPENSEARCH_JAVA_OPTS в compose-файле).
 дубли по SHA1 и пишет manifest.jsonl с происхождением каждого файла.
 Ссылку можно не указывать: по производителю URL строится автоматически
 (TI, ST, Microchip, NXP, onsemi, Diodes, Vishay, ROHM).
-Списки деталей берут из API дистрибьюторов (Octopart/Nexar, Digi-Key, Mouser,
-LCSC) — это легальный и надёжный путь. Агрегаторы вроде alldatasheet.com
-дают много сканов без текстового слоя: такие файлы распарсятся пустыми.
+Списки деталей берут из открытого дампа каталога JLCPCB/LCSC:
+  # скачай cache.sqlite3 с https://yaqwsx.github.io/jlcparts/
+  .venv/bin/python tools/rag/fetch_datasheets.py --from-jlcparts cache.sqlite3 \
+      --to-csv parts.csv --basic-only --min-stock 100
+Это миллионы SMD-позиций с парт-номером, корпусом и ссылкой на PDF, без API и
+ключей.
+  * Octopart/Nexar не годится: бесплатный план — ~1000 деталей в месяц.
+  * Digi-Key/Mouser/TME удобны для уточнения отдельных позиций, но условия
+    Digi-Key запрещают массовую выгрузку и построение базы из API.
+  * Агрегаторы вроде alldatasheet.com дают много сканов без текстового слоя —
+    такие файлы распарсятся пустыми.
 
 ШАГ 7. Тестовый корпус
 Если у пользователя есть свои PDF — путь к папке: /mnt/datasheets
