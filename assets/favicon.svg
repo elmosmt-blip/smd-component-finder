@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!-- SMD component: body with pins on two sides, in the site's cyan accent -->
+  <rect width="32" height="32" rx="6" fill="#0d1117"/>
+  <rect x="9" y="11" width="14" height="10" rx="1.5" fill="#22d3ee"/>
+  <g fill="#0d1117">
+    <rect x="11" y="13" width="3" height="2" rx="0.5"/>
+    <rect x="18" y="17" width="3" height="2" rx="0.5"/>
+  </g>
+  <g fill="#9aa7b4">
+    <rect x="8"  y="12" width="3" height="2.5" rx="0.5"/>
+    <rect x="8"  y="17.5" width="3" height="2.5" rx="0.5"/>
+    <rect x="21" y="12" width="3" height="2.5" rx="0.5"/>
+    <rect x="21" y="17.5" width="3" height="2.5" rx="0.5"/>
+  </g>
+</svg>
