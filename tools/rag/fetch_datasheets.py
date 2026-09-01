@@ -11,6 +11,11 @@ from.
     python3 tools/rag/fetch_datasheets.py --vendor st --parts st-parts.txt --out data/datasheets
     python3 tools/rag/fetch_datasheets.py --list parts.csv --dry-run   # show URLs
 
+300k files is a queue, not a for-loop: `--workers 16 --delay 0.05` keeps
+sixteen sockets busy while still spacing the requests out. Throughput is
+governed by `--delay` (requests start 1/delay seconds apart *per host*);
+`--workers` only stops network latency from eating that rate.
+
 Part list (CSV with a header, or JSON list):
     part,manufacturer,package,url
     STM32F103C8,STMicroelectronics,LQFP-48,https://www.st.com/resource/en/datasheet/stm32f103c8.pdf
@@ -20,9 +25,12 @@ Notes you should read before pointing this at a vendor:
     for your own local database is normal practice; republishing them (or
     serving the PDFs from a public site) is not — link to the vendor page
     instead.
-  * Distributor APIs (Octopart/Nexar, Digi-Key, Mouser, LCSC) are the
-    sanctioned way to obtain part lists and datasheet URLs, and they are far
-    more reliable than scraping. Get the list there, download the PDF here.
+  * Where the part list comes from: the open JLCPCB/LCSC catalogue dump
+    (`--from-jlcparts cache.sqlite3`, see the README) — millions of SMD parts,
+    no API key, no per-month limit. Vendor sites are for the gaps.
+    Octopart/Nexar is not enough: the free plan is ~1000 parts a month.
+    Digi-Key forbids bulk download and building a database from its API, so
+    its API is for completing a known list, not for harvesting.
   * robots.txt is honoured by default. If a host disallows the path, this
     script tells you which host and refuses — use an API instead of
     --ignore-robots.
@@ -35,12 +43,14 @@ import csv
 import hashlib
 import json
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 PDF_MAGIC = b"%PDF"
 MIN_PDF_BYTES = 4096                 # smaller than this is an error page, not a datasheet
@@ -103,6 +113,12 @@ class Fetcher:
         self._last_request: Dict[str, float] = {}
         self._robots: Dict[str, Optional[urllib.robotparser.RobotFileParser]] = {}
         self.seen_sha1: Dict[str, str] = {}      # sha1 -> filename already on disk
+        # One lock for the bookkeeping, one per host for the rate limit. The
+        # host lock is held only while a start slot is reserved — never across
+        # the socket — so N workers can have N requests in flight while the
+        # starts stay `delay` seconds apart.
+        self._lock = threading.RLock()
+        self._host_locks: Dict[str, threading.Lock] = {}
         self.manifest_path = self.out_dir / "manifest.jsonl"
         self.stats: Dict[str, int] = {"ok": 0, "skipped": 0, "duplicate": 0,
                                       "failed": 0, "blocked": 0}
@@ -127,10 +143,16 @@ class Fetcher:
         return rows
 
     def _record(self, row: dict) -> None:
-        """Append one manifest line. Called by fetch_one, always."""
+        """Append one manifest line. Called by fetch_one, always.
+
+        Serialised: with --workers the manifest is written from several
+        threads, and interleaved half-written lines would make the one file
+        that records where every PDF came from unreadable.
+        """
         try:
-            with self.manifest_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            with self._lock:
+                with self.manifest_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         except OSError as exc:
             print("cannot write manifest: %s" % exc, file=sys.stderr)
 
@@ -139,15 +161,19 @@ class Fetcher:
     def _robots_for(self, url: str) -> Optional[Any]:
         import urllib.robotparser
         host = urllib.parse.urlsplit(url)._replace(path="", query="", fragment="").geturl()
-        if host not in self._robots:
+        with self._lock:
+            cached = host in self._robots
+        if not cached:
             parser = urllib.robotparser.RobotFileParser()
             parser.set_url(host + "/robots.txt")
             try:
                 parser.read()
             except Exception:                      # noqa: BLE001 - no robots = allowed
                 parser = None
-            self._robots[host] = parser
-        return self._robots[host]
+            with self._lock:
+                self._robots[host] = parser
+        with self._lock:
+            return self._robots[host]
 
     def allowed(self, url: str) -> bool:
         if not self.respect_robots:
@@ -162,13 +188,28 @@ class Fetcher:
 
     # ---------------------------------------------------------------- fetch
 
+    def _host_lock(self, host: str) -> threading.Lock:
+        with self._lock:
+            lock = self._host_locks.get(host)
+            if lock is None:
+                lock = self._host_locks[host] = threading.Lock()
+            return lock
+
     def _wait(self, url: str) -> None:
+        """Reserve the next start slot on this host, then sleep until it.
+
+        Sequential code got the same politeness for free; with --workers the
+        slot has to be reserved *before* sleeping, otherwise every worker
+        wakes up at the same moment and the host sees a burst.
+        """
         host = urllib.parse.urlsplit(url).netloc
-        last = self._last_request.get(host, 0.0)
-        gap = time.time() - last
-        if gap < self.delay:
-            time.sleep(self.delay - gap)
-        self._last_request[host] = time.time()
+        with self._host_lock(host):
+            now = time.time()
+            start = max(now, self._last_request.get(host, 0.0) + self.delay)
+            self._last_request[host] = start
+        gap = start - time.time()
+        if gap > 0:
+            time.sleep(gap)
 
     def get(self, url: str) -> Tuple[int, bytes]:
         """Returns (status, body). Retries on 5xx and network errors."""
@@ -227,53 +268,103 @@ class Fetcher:
             "error": "",
             "downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        def fail(message: str, key: str = "failed") -> dict:
+            result["error"] = message
+            with self._lock:
+                self.stats[key] += 1
+            self._record(result)
+            return result
+
         if not url:
-            result["error"] = "no url"
-            self.stats["failed"] += 1
-            self._record(result)
-            return result
+            return fail("no url")
         if not self.allowed(url):
-            result["error"] = "robots.txt disallows this path (use a distributor API)"
-            self.stats["blocked"] += 1
-            self._record(result)
-            return result
+            return fail("robots.txt disallows this path (use a distributor API)",
+                        "blocked")
 
         status, body = self.get(url)
         result["status"] = status
         if status != 200 or not body:
-            result["error"] = "HTTP %d" % status if status else "network error"
-            self.stats["failed"] += 1
-            self._record(result)
-            return result
+            return fail("HTTP %d" % status if status else "network error")
         if not body.startswith(PDF_MAGIC) or len(body) < MIN_PDF_BYTES:
-            result["error"] = "not a PDF (%d bytes, starts with %r)" % (
-                len(body), body[:8])
-            self.stats["failed"] += 1
-            self._record(result)
-            return result
+            return fail("not a PDF (%d bytes, starts with %r)" % (
+                len(body), body[:8]))
 
         sha1 = hashlib.sha1(body).hexdigest()
         result["sha1"] = sha1
-        if sha1 in self.seen_sha1:
-            result["error"] = "duplicate of %s" % self.seen_sha1[sha1]
-            self.stats["duplicate"] += 1
-            self._record(result)
-            return result
-
-        path = self._target(part, url)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(body)
-        self.seen_sha1[sha1] = path.name
+        with self._lock:
+            known = self.seen_sha1.get(sha1)
+            if known:
+                return fail("duplicate of %s" % known, "duplicate")
+            # the whole name-claim-and-write is one critical section: two
+            # threads downloading the same file name must not both pick it
+            path = self._target(part, url)
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+            self.seen_sha1[sha1] = path.name
+            self.stats["ok"] += 1
         result["file"] = path.name
         result["bytes"] = len(body)
-        self.stats["ok"] += 1
         if self.verbose:
             print("  [%5.1f KB] %s <- %s" % (len(body) / 1024, path.name, url))
         self._record(result)
         return result
 
+    # --------------------------------------------------------------- in bulk
+
+    def fetch_many(self, rows: List[Dict[str, Any]], workers: int = 1,
+                   on_result: Optional[Callable[[int, dict, dict], None]] = None
+                   ) -> List[dict]:
+        """Download a list, in parallel if asked.
+
+        Results come back in the order the rows were given, so a rerun prints
+        the same summary as a sequential one — only the progress lines arrive
+        in completion order, which is the point of going parallel.
+
+        `workers` only helps to hide latency: the rate is set by `--delay`.
+        """
+        rows = list(rows)
+        if workers <= 1 or len(rows) < 2:
+            out = []
+            for i, row in enumerate(rows):
+                result = self.fetch_one(row)
+                out.append(result)
+                if on_result:
+                    on_result(i, row, result)
+            return out
+
+        out: List[Optional[dict]] = [None] * len(rows)
+        with ThreadPoolExecutor(max_workers=min(workers, len(rows))) as pool:
+            futures = {pool.submit(self.fetch_one, row): i
+                       for i, row in enumerate(rows)}
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:            # noqa: BLE001 - never kill the run
+                    result = {"part": str(rows[i].get("part") or ""),
+                              "error": "%s: %s" % (type(exc).__name__, exc),
+                              "file": ""}
+                    with self._lock:
+                        self.stats["failed"] += 1
+                out[i] = result
+                if on_result:
+                    on_result(i, rows[i], result)
+        return [r if r is not None else {"part": "", "error": "no result", "file": ""}
+                for r in out]
+
 
 # --------------------------------------------------------------------- input
+
+def _fmt_hours(seconds: float) -> str:
+    """'3.5 days' rather than '302400.0s' — the number people actually need
+    before starting a 300k download."""
+    if seconds < 90:
+        return "%.0f s" % seconds
+    hours = seconds / 3600.0
+    if hours < 48:
+        return "%.1f h" % hours
+    return "%.1f days" % (hours / 24.0)
+
 
 def build_url(vendor: str, part: str) -> str:
     pattern = VENDOR_PATTERNS[vendor]
@@ -328,7 +419,34 @@ JLC_PACKAGE_COLUMNS = ("package", "footprint")
 JLC_URL_COLUMNS = ("datasheet", "url", "datasheet_url")
 
 
-def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "parts",
+def _source_table(con, tables: List[str], views: List[str], wanted: str) -> str:
+    """Which relation to read: the joined view if it is there, else the table.
+
+    jlcparts ships `components` (mfr, package, datasheet, manufacturer_id,
+    category_id) *and* a view `v_components` that already carries the
+    manufacturer name and the category names. Reading the view saves two
+    joins on a 7-million-row table — which on an 11 GB database is the
+    difference between a minute and a coffee break.
+    """
+    if wanted in tables or wanted in views:
+        return wanted
+    for name in ("v_components", "components", "parts", "v_parts"):
+        if name in views or name in tables:
+            return name
+    return ""
+
+
+def _fmt_lcsc(value: Any) -> str:
+    """jlcparts stores the LCSC code as 123456; humans write C123456."""
+    if value in (None, ""):
+        return ""
+    text = str(value).strip()
+    if text.isdigit():
+        return "C" + text
+    return text
+
+
+def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "",
                        basic_only: bool = False, min_stock: int = 0,
                        category: str = "", limit: int = 0,
                        verbose: bool = False) -> int:
@@ -337,19 +455,32 @@ def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "parts",
     Nothing here assumes a schema: columns are found by name, and if the file
     does not look like a parts catalogue the available columns are printed so
     you can map them yourself with a `--list` CSV of your own.
+
+    The real jlcparts `cache.sqlite3` looks like this, and all three variants
+    are handled:
+
+        components(lcsc, mfr, package, datasheet, stock, basic, preferred,
+                   manufacturer_id, category_id, ...)
+        manufacturers(id, name)      categories(id, category, subcategory)
+        v_components                 -- the same, with names joined in
+
+    Note the trap: `mfr` is the *part number*, not the manufacturer. The
+    manufacturer's name only exists in `manufacturers` (or in the view).
     """
     import sqlite3
 
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
     try:
-        tables = [r[0] for r in con.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")]
-        if table not in tables:
-            candidates = [t for t in tables if t.endswith("parts")] or tables[:5]
-            raise SystemExit("no table %r in %s; available: %s"
-                             % (table, db_path.name, ", ".join(tables[:12])))
-        cols = [r[1] for r in con.execute("PRAGMA table_info(%s)" % table)]
+        objects = [(r[0], r[1]) for r in con.execute(
+            "SELECT name, type FROM sqlite_master WHERE type IN ('table','view')")]
+        tables = [n for n, t in objects if t == "table"]
+        views = [n for n, t in objects if t == "view"]
+        source = _source_table(con, tables, views, table)
+        if not source:
+            raise SystemExit("no usable table in %s; available: %s"
+                             % (db_path.name, ", ".join(tables[:12])))
+        cols = [r[1] for r in con.execute("PRAGMA table_info(%s)" % source)]
 
         def pick(options: Iterable[str]) -> str:
             for name in options:
@@ -363,66 +494,75 @@ def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "parts",
         if not part_col or not url_col:
             raise SystemExit(
                 "cannot map %s: need a part-number column %s and a datasheet "
-                "column %s; the file has: %s"
+                "column %s; %s has: %s"
                 % (db_path.name, list(JLC_PART_COLUMNS), list(JLC_URL_COLUMNS),
-                   ", ".join(cols)))
+                   source, ", ".join(cols)))
 
-        mfr_col = pick(("manufacturer", "manufacturer_name", "brand"))
-        mfr_join = ""
+        mfr_col = pick(("manufacturer", "manufacturer_name", "brand", "mfr_name"))
+        joins = ""
         if not mfr_col and "manufacturer_id" in cols and "manufacturers" in tables:
-            mfr_join = (" LEFT JOIN manufacturers mn ON mn.id = p.manufacturer_id")
+            joins += " LEFT JOIN manufacturers mn ON mn.id = p.manufacturer_id"
             mfr_col = "mn.name"
-        lcsc_col = pick(("lcsc", "lcsc_part", "id"))
+        lcsc_col = pick(("lcsc", "lcsc_part"))
 
         where, args = [], []
-        if url_col:
-            where.append("TRIM(COALESCE(p.%s, '')) != ''" % url_col)
-        if basic_only and "basic" in cols:
-            where.append("p.basic = 1")
-        if min_stock and "stock" in cols:
-            where.append("COALESCE(p.stock, 0) >= ?"); args.append(min_stock)
+        where.append("TRIM(COALESCE(p.%s, '')) != ''" % url_col)
+        if basic_only:
+            flags = [c for c in ("basic", "preferred") if c in cols]
+            if flags:
+                where.append("(" + " OR ".join("p.%s = 1" % c for c in flags) + ")")
+            else:
+                print("warning: no basic/preferred column, --basic-only ignored")
+        if min_stock:
+            stock_col = pick(("stock", "last_on_stock", "quantity"))
+            if stock_col:
+                where.append("COALESCE(p.%s, 0) >= ?" % stock_col)
+                args.append(min_stock)
         if category:
             like = "%%%s%%" % category
-            if "category_id" in cols and "categories" in tables:
-                # Parentheses matter: AND binds tighter than OR, so without
-                # them the datasheet filter silently stops applying as soon
-                # as a category is requested.
+            cat_cols = [c for c in ("category", "subcategory") if c in cols]
+            if cat_cols:                     # the view already has the names
+                where.append("(" + " OR ".join(
+                    "COALESCE(p.%s, '') LIKE ?" % c for c in cat_cols) + ")")
+                args += [like] * len(cat_cols)
+            elif "category_id" in cols and "categories" in tables:
+                joins += " LEFT JOIN categories c ON c.id = p.category_id"
                 where.append("(COALESCE(c.category, '') LIKE ? "
                              "OR COALESCE(c.subcategory, '') LIKE ?)")
                 args += [like, like]
-                mfr_join += (" LEFT JOIN categories c ON c.id = p.category_id")
             else:
                 print("warning: no categories table, --category ignored")
 
-        select = ["p.%s AS part" % part_col]
-        if mfr_col:
-            select.append("%s AS manufacturer" % mfr_col)
-        else:
-            select.append("'' AS manufacturer")
-        select.append("COALESCE(p.%s, '') AS package" % pkg_col if pkg_col
-                      else "'' AS package")
-        select.append("p.%s AS url" % url_col)
+        select = ["p.%s AS part" % part_col,
+                  "%s AS manufacturer" % mfr_col if mfr_col else "'' AS manufacturer",
+                  "COALESCE(p.%s, '') AS package" % pkg_col if pkg_col else "'' AS package",
+                  "p.%s AS url" % url_col]
         if lcsc_col and lcsc_col != part_col:
             select.append("p.%s AS lcsc" % lcsc_col)
 
-        sql = ("SELECT DISTINCT %s FROM %s p%s %s %s"
-               % (", ".join(select), table, mfr_join,
-                  ("WHERE " + " AND ".join(where)) if where else "",
-                  "LIMIT %d" % limit if limit else ""))
+        sql = ("SELECT DISTINCT %s FROM %s p%s WHERE %s%s"
+               % (", ".join(select), source, joins, " AND ".join(where),
+                  " LIMIT %d" % limit if limit else ""))
         rows = con.execute(sql, args).fetchall()
     finally:
         con.close()
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
+    header = ["part", "manufacturer", "package", "url"]
+    if lcsc_col and lcsc_col != part_col:
+        header.append("lcsc")
     with out_csv.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["part", "manufacturer", "package", "url"])
+        writer.writerow(header)
         for row in rows:
             writer.writerow([row["part"] or "", row["manufacturer"] or "",
-                             row["package"] or "", row["url"] or ""])
+                             row["package"] or "", row["url"] or ""]
+                            + ([_fmt_lcsc(row["lcsc"])]
+                               if header[-1] == "lcsc" else []))
     if verbose:
-        print("Exported %d parts -> %s" % (len(rows), out_csv))
+        print("Exported %d parts from %s -> %s" % (len(rows), source, out_csv))
     return len(rows)
+
 
 
 def main() -> int:
@@ -442,6 +582,9 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=Path("data/datasheets"))
     ap.add_argument("--delay", type=float, default=1.0, help="seconds between requests, per host")
     ap.add_argument("--retries", type=int, default=3)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel downloads (1-32). The rate is still set by "
+                         "--delay; workers only hide network latency")
     ap.add_argument("--timeout", type=float, default=45.0)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--user-agent", default="")
@@ -488,18 +631,30 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     fetcher.load_manifest()
 
+    workers = max(1, min(32, int(args.workers or 1)))
+    done = [0]
+    total = len(rows)
+
+    def report(index: int, row: dict, result: dict) -> None:
+        if args.verbose:
+            if result.get("error"):
+                print("         %s" % result["error"])
+            return
+        done[0] += 1
+        tail = result.get("file") or result.get("error") or ""
+        print("  [%4d/%4d] %-22s %s" % (done[0], total, row.get("part", "?"), tail))
+
     started = time.time()
-    for i, row in enumerate(rows, start=1):
-        result = fetcher.fetch_one(row)
-        if not args.verbose:
-            tail = result["file"] or result["error"]
-            print("  [%4d/%4d] %-22s %s" % (i, len(rows), row.get("part", "?"), tail))
-        if result["error"] and args.verbose:
-            print("         %s" % result["error"])
+    fetcher.fetch_many(rows, workers=workers, on_result=report)
+    elapsed = max(time.time() - started, 1e-6)
 
     print("\nDownloaded %d, duplicates %d, failed %d, blocked by robots %d in %.1fs"
           % (fetcher.stats["ok"], fetcher.stats["duplicate"], fetcher.stats["failed"],
-             fetcher.stats["blocked"], time.time() - started))
+             fetcher.stats["blocked"], elapsed))
+    if fetcher.stats["ok"]:
+        print("Rate: %.2f files/s (%d workers, delay %.2fs) — 300 000 files would take %s"
+              % (fetcher.stats["ok"] / elapsed, workers, args.delay,
+                 _fmt_hours(300000 * elapsed / fetcher.stats["ok"])))
     print("Manifest:  %s" % fetcher.manifest_path)
     print("Corpus:    %s — now run: python3 tools/rag/build_cards.py --corpus %s"
           % (args.out, args.out))

@@ -18,6 +18,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -28,8 +29,9 @@ from tools.rag import fetch_datasheets as fd  # noqa: E402
 from tools.rag.sample_datasheets import DATASHEETS, build_pdf  # noqa: E402
 
 PASS = FAIL = 0
-STATE = {"flaky_hits": 0}
+STATE = {"flaky_hits": 0, "inflight": 0, "max_inflight": 0}
 ROBOTS = {"mode": "allow"}
+SLOW_PDFS = {}          # /slow/<name>.pdf -> distinct bytes, filled in main()
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -84,6 +86,17 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(200, self.pdf_d, "application/pdf")
         if path == "/no-extension":
             return self._send(200, self.pdf_c, "application/pdf")
+        if path.startswith("/slow/"):
+            # Deliberately slow: a parallel run must overlap these, a
+            # sequential one cannot. The high-water mark is the proof.
+            name = path.rsplit("/", 1)[-1]
+            with threading.Lock():
+                STATE["inflight"] += 1
+                STATE["max_inflight"] = max(STATE["max_inflight"], STATE["inflight"])
+            time.sleep(0.2)
+            with threading.Lock():
+                STATE["inflight"] -= 1
+            return self._send(200, SLOW_PDFS.get(name, self.pdf_a), "application/pdf")
         self.send_response(404)
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -111,6 +124,10 @@ def main() -> int:
     pdf_d = build_pdf(spec_d, source).read_bytes()
     _Handler.pdf_a, _Handler.pdf_b = pdf_a, pdf_b
     _Handler.pdf_c, _Handler.pdf_d = pdf_c, pdf_d
+    for i in range(8):                      # distinct bytes, or dedup eats them
+        spec = dict(DATASHEETS[0])
+        spec["part"] = "SLOWPART%d" % i
+        SLOW_PDFS["slow%d.pdf" % i] = build_pdf(spec, source).read_bytes()
 
     port = free_port()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
@@ -237,6 +254,60 @@ def main() -> int:
               fd.vendor_of({"manufacturer": "Diodes Incorporated"}) == "diodes")
         check("неизвестный производитель — пусто",
               fd.vendor_of({"manufacturer": "Mystery Corp"}) == "")
+        print("\n--- параллельная загрузка (--workers) ---")
+        par_out = tmp / "parallel"
+        par_out.mkdir()
+        par = fd.Fetcher(par_out, delay=0.02, retries=1, timeout=10)
+        many = [{"part": "SLOWPART%d" % i, "manufacturer": "test",
+                 "package": "SOT-23", "url": base + "/slow/slow%d.pdf" % i}
+                for i in range(8)]
+        STATE["max_inflight"] = 0
+        started = time.time()
+        results = par.fetch_many(many, workers=8)
+        parallel_elapsed = time.time() - started
+        check("все 8 файлов скачаны",
+              sum(1 for r in results if r.get("file")) == 8,
+              str([r.get("file") or r.get("error") for r in results]))
+        check("порядок результатов совпадает с порядком заявки",
+              [r.get("file") for r in results] == ["slow%d.pdf" % i for i in range(8)],
+              str([r.get("file") for r in results]))
+        check("запросы шли параллельно, не по одному",
+              STATE["max_inflight"] >= 3, str(STATE["max_inflight"]))
+        check("параллельно быстрее последовательного",
+              parallel_elapsed < 0.2 * 8 * 0.75, "%.2fs" % parallel_elapsed)
+        files = sorted(p.name for p in par_out.glob("*.pdf"))
+        check("на диске 8 разных файлов", len(files) == 8 and len(set(files)) == 8,
+              str(files))
+        manifest = [json.loads(l) for l in
+                    (par_out / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+                    if l.strip()]
+        check("манифест не перетёрся потоками", len(manifest) == 8, str(len(manifest)))
+        check("каждая строка манифеста — валидный json",
+              all(r.get("part", "").startswith("SLOWPART") for r in manifest),
+              str(manifest[:2]))
+        check("счётчики совпадают с фактом",
+              par.stats["ok"] == 8 and par.stats["failed"] == 0, str(par.stats))
+
+        # two rows, same file: dedup has to survive the threads too
+        dup_out = tmp / "parallel-dup"
+        dup_out.mkdir()
+        duper = fd.Fetcher(dup_out, delay=0.0, retries=1, timeout=10)
+        dup_rows = [{"part": "DUPA", "url": base + "/slow/slow0.pdf"},
+                    {"part": "DUPB", "url": base + "/slow/slow0.pdf"}]
+        dup_results = duper.fetch_many(dup_rows, workers=4)
+        check("одинаковый файл сохранён один раз и в параллельном режиме",
+              sum(1 for r in dup_results if r.get("file")) == 1,
+              str([r.get("file") or r.get("error") for r in dup_results]))
+        check("на диске один PDF", len(list(dup_out.glob("*.pdf"))) == 1)
+
+        seq_out = tmp / "sequential"
+        seq_out.mkdir()
+        seq = fd.Fetcher(seq_out, delay=0.0, retries=1, timeout=10)
+        seq_results = seq.fetch_many(many, workers=1)
+        check("workers=1 даёт тот же результат, что и раньше",
+              sum(1 for r in seq_results if r.get("file")) == 8,
+              str([r.get("file") or r.get("error") for r in seq_results]))
+
         print("\n--- экспорт списка из каталога JLCPCB/LCSC ---")
         db = tmp / "cache.sqlite3"
         con = sqlite3.connect(str(db))
@@ -301,6 +372,79 @@ def main() -> int:
         check("корпус взят из footprint",
               fd.read_list(out2)[0]["package"] == "SOIC-8",
               str(fd.read_list(out2)[0]))
+
+        print("\n--- настоящая схема jlcparts: components + view ---")
+        dbj = tmp / "jlc-real.sqlite3"
+        con = sqlite3.connect(str(dbj))
+        con.executescript("""
+            CREATE TABLE manufacturers (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE categories (id INTEGER PRIMARY KEY, category TEXT,
+                                     subcategory TEXT);
+            CREATE TABLE components (
+                lcsc INTEGER PRIMARY KEY, category_id INTEGER, mfr TEXT,
+                package TEXT, joints INTEGER, manufacturer_id INTEGER,
+                basic INTEGER, preferred INTEGER DEFAULT 0, description TEXT,
+                datasheet TEXT, stock INTEGER, price TEXT, last_update INTEGER,
+                extra TEXT, flag INTEGER DEFAULT 0);
+            INSERT INTO manufacturers VALUES (1,'onsemi'),(2,'Texas Instruments');
+            INSERT INTO categories VALUES (1,'Transistors','Bipolar'),
+                                          (2,'Power Management','LDO');
+            INSERT INTO components VALUES
+                (12345,1,'MMBT3904','SOT-23',3,1,1,0,'NPN',
+                 'https://x/MMBT3904.pdf',900,'[]',0,'{}',0),
+                (12346,2,'TPS7A05','SOT-23-5',5,2,0,1,'LDO',
+                 'https://x/TPS7A05.pdf',10,'[]',0,'{}',0),
+                (12347,1,'NODATA','SOT-23',3,1,1,0,'?','',0,'[]',0,'{}',0);
+            CREATE VIEW v_components AS
+                SELECT c.lcsc AS lcsc, c.category_id AS category_id,
+                       cat.category AS category, cat.subcategory AS subcategory,
+                       c.mfr AS mfr, c.package AS package, c.joints AS joints,
+                       m.name AS manufacturer, c.basic AS basic,
+                       c.preferred AS preferred, c.description AS description,
+                       c.datasheet AS datasheet, c.stock AS stock
+                FROM components c
+                LEFT JOIN manufacturers m ON c.manufacturer_id = m.id
+                LEFT JOIN categories cat ON c.category_id = cat.id;
+        """)
+        con.commit(); con.close()
+
+        real = tmp / "real.csv"
+        n_real = fd.export_from_sqlite(dbj, real)
+        rows_real = fd.read_list(real)
+        check("экспортированы обе позиции со ссылкой", n_real == 2, str(n_real))
+        check("mfr — это парт-номер, а не производитель",
+              {r["part"] for r in rows_real} == {"MMBT3904", "TPS7A05"},
+              str([r["part"] for r in rows_real]))
+        check("производитель взят из view",
+              {r["part"]: r["manufacturer"] for r in rows_real} ==
+              {"MMBT3904": "onsemi", "TPS7A05": "Texas Instruments"}, str(rows_real))
+        check("код LCSC приведён к виду C12345",
+              rows_real[0]["lcsc"] == "C12345", str(rows_real[0].get("lcsc")))
+
+        forced = tmp / "forced.csv"
+        fd.export_from_sqlite(dbj, forced, table="components")
+        check("та же выгрузка и без view, через join",
+              [r["part"] for r in fd.read_list(forced)] ==
+              [r["part"] for r in rows_real],
+              str([r["part"] for r in fd.read_list(forced)]))
+
+        pref = tmp / "pref.csv"
+        fd.export_from_sqlite(dbj, pref, basic_only=True)
+        check("--basic-only берёт и basic, и preferred",
+              [r["part"] for r in fd.read_list(pref)] == ["MMBT3904", "TPS7A05"],
+              str([r["part"] for r in fd.read_list(pref)]))
+
+        stocky = tmp / "stocky.csv"
+        fd.export_from_sqlite(dbj, stocky, min_stock=100)
+        check("--min-stock считает по колонке stock",
+              [r["part"] for r in fd.read_list(stocky)] == ["MMBT3904"],
+              str([r["part"] for r in fd.read_list(stocky)]))
+
+        cats = tmp / "cats.csv"
+        fd.export_from_sqlite(dbj, cats, category="LDO")
+        check("--category ищет и по подкатегории",
+              [r["part"] for r in fd.read_list(cats)] == ["TPS7A05"],
+              str([r["part"] for r in fd.read_list(cats)]))
 
         db3 = tmp / "broken.sqlite3"
         con = sqlite3.connect(str(db3))

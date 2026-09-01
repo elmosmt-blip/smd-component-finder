@@ -548,8 +548,13 @@ python3 tools/rag/fetch_datasheets.py --list parts.csv --out data/datasheets --d
 ### Из каталога JLCPCB/LCSC — одной командой
 
 ```bash
-# 1. скачайте cache.sqlite3 с https://yaqwsx.github.io/jlcparts/
-#    (архив разбит на части: cat cache.z* cache.zip > all.zip && unzip all.zip)
+# 1. скачайте cache.sqlite3 (~3-4 ГБ в архиве, ~11 ГБ после распаковки).
+#    Файл разбит на тома по 50 МБ, томов бывает больше двухсот — качайте все,
+#    пока сервер не вернёт 404:
+#      https://yaqwsx.github.io/jlcparts/data/cache.zip
+#      https://yaqwsx.github.io/jlcparts/data/cache.z01
+#      https://yaqwsx.github.io/jlcparts/data/cache.z02   ...
+#    Распаковка многотомника требует 7-Zip: 7z x cache.zip
 
 # 2. превратите каталог в список деталей
 python3 tools/rag/fetch_datasheets.py --from-jlcparts cache.sqlite3 \
@@ -557,8 +562,22 @@ python3 tools/rag/fetch_datasheets.py --from-jlcparts cache.sqlite3 \
 
 # 3. посмотрите, что получится, и скачайте
 python3 tools/rag/fetch_datasheets.py --list parts.csv --out data/datasheets --dry-run
-python3 tools/rag/fetch_datasheets.py --list parts.csv --out data/datasheets --delay 1.0
+python3 tools/rag/fetch_datasheets.py --list parts.csv --out data/datasheets \
+        --delay 0.2 --workers 8
 ```
+
+Скорость загрузки задаёт `--delay` (минимальный промежуток между стартами
+запросов на один хост), а `--workers` держит несколько соединений открытыми,
+чтобы латентность не съедала эту скорость. `--delay 0.2 --workers 8` — это
+около 5 файлов/с; `--delay 0.05 --workers 16` — около 20 файлов/с, то есть
+300 000 файлов за вечер. Скрипт печатает скорость и сам extrapolate время на
+300 000, а прерванную загрузку продолжает той же командой.
+
+Про схему базы есть одна ловушка, которую экспортёр знает: таблица называется
+`components`, и колонка `mfr` в ней означает **парт-номер**, а не
+производителя — имя производителя лежит в отдельной таблице `manufacturers`
+(или в представлении `v_components`, где всё уже сджойнено; экспортёр
+предпочитает его).
 
 `--basic-only` оставляет только basic/preferred (то, что ставят без доплаты),
 `--min-stock` отсеивает позиции без склада, `--category` фильтрует по имени
