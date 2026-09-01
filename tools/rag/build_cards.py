@@ -43,8 +43,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from tools.rag import card_store, cli, ingest, parsers  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_CORPUS = ROOT / "data" / "datasheets"
-DEFAULT_OUT = ROOT / "data" / "cards"
+# SMD_DATA_DIR moves the whole data directory — see serve.py. Kept in sync so
+# a run started here lands where the site and doctor.py will look for it.
+DATA_DIR = Path(os.environ.get("SMD_DATA_DIR") or (ROOT / "data"))
+DEFAULT_CORPUS = DATA_DIR / "datasheets"
+DEFAULT_OUT = DATA_DIR / "cards"
 
 _STOP = False
 

@@ -15,6 +15,8 @@ Stages:
 
 from __future__ import annotations
 
+import os
+
 import argparse
 import json
 import sys
@@ -28,8 +30,13 @@ from tools.rag import chunking, cli, index_db, metadata, opensearch_index, parse
 from tools.rag.embeddings import get_backend
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_CORPUS = ROOT / "data" / "datasheets"
-DEFAULT_OUT = ROOT / "data" / "rag"
+# Same rule as serve.py and doctor.py: SMD_DATA_DIR moves the whole data
+# directory. Without it the index would land in ./data while the site and the
+# diagnostics look somewhere else — and doctor.py would report "index not
+# built" for an index that exists.
+DATA_DIR = Path(os.environ.get("SMD_DATA_DIR") or (ROOT / "data"))
+DEFAULT_CORPUS = DATA_DIR / "datasheets"
+DEFAULT_OUT = DATA_DIR / "rag"
 
 
 def build(corpus: Path, out: Path, parser_name: str = "auto", embed: str = "none",

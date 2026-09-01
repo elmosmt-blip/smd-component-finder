@@ -29,6 +29,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.rag import cli  # noqa: E402
+from tools.rag import quality
+
 
 DATA_DIR = Path(os.environ.get("SMD_DATA_DIR") or (ROOT / "data"))
 CARDS = DATA_DIR / "cards" / "cards.db"
@@ -48,26 +50,62 @@ def ok(bad: bool, text: str) -> None:
 
 
 def run(cmd: list) -> str:
+    """One line of output from a helper binary, or why it did not happen.
+
+    A missing binary is not a failure: `lsb_release` is absent on Windows and
+    `docker` is absent on plenty of machines. Saying "не найден" instead of
+    "не удалось: FileNotFoundError" is the difference between a diagnosis and
+    noise in a chat window.
+    """
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
         return (out.stdout or out.stderr or "").strip().splitlines()[0][:120]
+    except FileNotFoundError:
+        return "не найден (%s)" % cmd[0]
     except Exception as exc:                      # noqa: BLE001
         return "не удалось: %s" % type(exc).__name__
 
 
+def os_name() -> str:
+    """Windows has no lsb_release, so asking for it prints an error instead of
+    an OS — and the machine block is the first thing anyone reads."""
+    if os.name == "nt":
+        return "Windows %s" % platform.platform()
+    distro = run(["lsb_release", "-ds"])
+    if distro and not distro.startswith("не "):
+        return distro
+    try:
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+            if line.startswith("PRETTY_NAME="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return platform.platform()
+
+
+def ram_total() -> str:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return "%.1f ГБ" % (int(line.split()[1]) / 2 ** 20)
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import psutil
+        return "%.1f ГБ" % (psutil.virtual_memory().total / 2 ** 30)
+    except ImportError:
+        return ""
+
+
 def machine() -> None:
     head("Машина")
-    distro = run(["lsb_release", "-ds"])
-    print("  ОС:        %s" % (distro or platform.platform()))
+    print("  ОС:        %s" % os_name())
     print("  Ядро:      %s" % platform.release())
     print("  CPU:       %s, %d логических ядер" % (platform.processor() or platform.machine(),
                                                    os.cpu_count() or 1))
-    try:
-        ram = [l for l in Path("/proc/meminfo").read_text().splitlines()
-               if l.startswith("MemTotal:")]
-        print("  Память:    %s" % ram[0].split(":", 1)[1].strip() if ram else "?")
-    except OSError:
-        pass
+    ram = ram_total()
+    if ram:
+        print("  Память:    %s" % ram)
     total, used, free = shutil.disk_usage(str(ROOT))
     print("  Диск:      свободно %.1f ГБ из %.1f ГБ" % (free / 2**30, total / 2**30))
     print("  Python:    %s (%s)" % (sys.version.split()[0], sys.executable))
@@ -113,6 +151,18 @@ def opensearch() -> None:
               % run(["docker", "inspect", "-f", "{{.State.Status}}", "smd-opensearch"]))
 
 
+RU_REASON = {
+    "scan": "скан без текста",
+    "low_text": "мало текста",
+    "no_tables": "нет таблиц",
+    "no_package": "нет корпуса",
+    "no_pins": "нет распиновки",
+    "no_manufacturer": "нет производителя",
+    "no_description": "нет описания",
+    "part_from_filename": "парт из имени файла",
+}
+
+
 def database() -> None:
     head("База карточек")
     if not CARDS.exists():
@@ -138,6 +188,30 @@ def database() -> None:
             "SELECT part FROM cards ORDER BY part LIMIT 8").fetchall()
         if parts:
             print("  Примеры: %s" % ", ".join(p["part"] for p in parts))
+
+        # How uneven is the corpus? A card is only as rich as its PDF, so the
+        # interesting number is not "2408 cards" but "how many of them are
+        # actually usable".
+        try:
+            tiers = {"full": 0, "partial": 0, "sparse": 0, "empty": 0}
+            reasons = {}
+            for row in con.execute("SELECT card, flags FROM cards").fetchall():
+                card = json.loads(row["card"] or "{}")
+                if row["flags"] is not None:
+                    card.setdefault("flags", json.loads(row["flags"] or "[]"))
+                tiers[quality.tier(card)] += 1
+                for code in quality.reason_codes(card):
+                    reasons[code] = reasons.get(code, 0) + 1
+            print("  [ok] полнота: полных %d, средних %d, бедных %d, пустых %d"
+                  % (tiers["full"], tiers["partial"], tiers["sparse"], tiers["empty"]))
+            if reasons:
+                top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
+                print("       причины пустых: %s" % ", ".join(
+                    "%s %d" % (RU_REASON.get(code, code), n) for code, n in top))
+            if tiers["sparse"] + tiers["empty"]:
+                print("       подробно: python3 tools/rag/audit_cards.py --top 10")
+        except (sqlite3.Error, ValueError) as exc:
+            print("  [--] полноту не посчитать: %s" % exc)
     except sqlite3.Error as exc:
         print("  [!!] не читается: %s" % exc)
     finally:
@@ -154,8 +228,20 @@ def database() -> None:
         docs = con.execute("SELECT COUNT(*) n FROM docs").fetchone()["n"]
         tables = con.execute("SELECT COUNT(*) n FROM chunks WHERE is_table = 1").fetchone()["n"]
         vecs = con.execute("SELECT COUNT(*) n FROM vectors").fetchone()["n"]
+        size_mb = INDEX.stat().st_size / 1e6
+        per_doc = (chunks / docs) if docs else 0
         print("  [ok] чанков: %d из %d документов (таблиц %d, векторов %d)"
               % (chunks, docs, tables, vecs))
+        print("       %.0f чанков на документ, %.1f МБ на диске" % (per_doc, size_mb))
+        if chunks and per_doc:
+            print("       экстраполяция на 300 000 PDF: %.1f млн чанков, %.0f ГБ"
+                  % (300000 * per_doc / 1e6, 300000 * per_doc / chunks * size_mb / 1000))
+            if chunks > 200000:
+                print("       столько SQLite не вывезет — нужен OpenSearch")
+        try:
+            con.execute("SELECT COUNT(*) FROM chunks WHERE is_table = 1")
+        except sqlite3.Error:
+            pass
     except sqlite3.Error as exc:
         print("  [!!] не читается: %s" % exc)
     finally:

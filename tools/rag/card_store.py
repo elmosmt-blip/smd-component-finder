@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS cards (
     features      TEXT,
     headline      TEXT,
     card          TEXT NOT NULL,
+    flags         TEXT,
     updated_at    REAL
 );
 CREATE INDEX IF NOT EXISTS idx_cards_pkg   ON cards(package);
@@ -75,6 +76,21 @@ def shard_key(part: str) -> str:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _load_flags(row) -> List[str]:
+    """The `flags` column, tolerating rows written before it existed."""
+    try:
+        raw = row["flags"]
+    except (IndexError, KeyError):
+        return []
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [str(x) for x in value] if isinstance(value, list) else []
 
 
 def card_score(card: dict) -> float:
@@ -116,6 +132,28 @@ def _serialized(cls):
     return cls
 
 
+def _migrate(con: sqlite3.Connection) -> None:
+    """Add columns that older databases do not have.
+
+    `CREATE TABLE IF NOT EXISTS` silently does nothing when the table is
+    already there, so a cards.db built before `flags` existed would stay
+    without it forever and every card would come back flag-less. One ALTER
+    per missing column, and a database in the middle of being written by
+    another process is not an error.
+    """
+    wanted = {"flags": "TEXT", "family": "TEXT", "pin_count": "INTEGER"}
+    try:
+        have = {r["name"] for r in con.execute("PRAGMA table_info(cards)")}
+    except sqlite3.Error:
+        return
+    for column, decl in wanted.items():
+        if column not in have:
+            try:
+                con.execute("ALTER TABLE cards ADD COLUMN %s %s" % (column, decl))
+            except sqlite3.Error:
+                pass
+
+
 @_serialized
 class CardStore:
     def __init__(self, path: Path):
@@ -145,6 +183,7 @@ class CardStore:
         con.execute("PRAGMA mmap_size=1073741824")      # 1 GB — RAM is not the limit
         con.execute("PRAGMA wal_autocheckpoint=16384")  # ~64 MB between checkpoints
         con.executescript(SCHEMA)
+        _migrate(con)
         con.commit()
         return con
 
@@ -189,15 +228,15 @@ class CardStore:
         self.conn.execute(
             """INSERT INTO cards (part, part_key, manufacturer, package, family,
                    pin_count, confidence, pages, tables, filename, sha1, parser,
-                   description, features, headline, card, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   description, features, headline, card, flags, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 part, part.upper(), card.get("manufacturer"), card.get("package"),
                 card.get("family"), card.get("pin_count"), card.get("confidence", 0.0),
                 card.get("pages", 0), card.get("tables", 0), card.get("filename"),
                 card.get("sha1"), card.get("parser"), card.get("description", ""),
                 _json(card.get("features") or []), _json(card.get("headline") or []),
-                _json(card), time.time(),
+                _json(card), _json(card.get("flags") or []), time.time(),
             ),
         )
         self._index(part)
@@ -283,7 +322,7 @@ class CardStore:
                 sql = (
                     "SELECT c.part, c.manufacturer, c.package, c.family, c.pin_count,"
                     " c.confidence, c.description, c.headline, c.filename, c.pages,"
-                    " bm25(cards_fts) AS rank"
+                    " c.flags, bm25(cards_fts) AS rank"
                     " FROM cards_fts f JOIN cards c ON c.rowid = f.rowid"
                     " WHERE cards_fts MATCH ?" + (" AND " + " AND ".join(where) if where else "") +
                     " ORDER BY rank LIMIT ? OFFSET ?"
@@ -296,8 +335,9 @@ class CardStore:
                 return [self._brief(r) for r in rows], total
 
         rows = self.conn.execute(
-            "SELECT part, manufacturer, package, family, pin_count, confidence,"
-            " description, headline, filename, pages FROM cards c" + clause +
+            "SELECT c.part, c.manufacturer, c.package, c.family, c.pin_count,"
+            " c.confidence, c.description, c.headline, c.filename, c.pages,"
+            " c.flags FROM cards c" + clause +
             " ORDER BY part LIMIT ? OFFSET ?", args + [limit, offset]).fetchall()
         total = self.conn.execute(
             "SELECT COUNT(*) FROM cards c" + clause, args).fetchone()[0]
@@ -316,6 +356,7 @@ class CardStore:
             "headline": json.loads(row["headline"] or "[]"),
             "filename": row["filename"],
             "pages": row["pages"],
+            "flags": _load_flags(row),
         }
 
     def facets(self) -> Dict[str, List[Tuple[str, int]]]:

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from tools.rag import metadata
+from tools.rag import metadata, quality
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +282,8 @@ class Card:
     confidence: float = 0.0
     sources: dict = field(default_factory=dict)
     extracted_at: str = ""
+    text_chars: int = 0
+    flags: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -888,6 +890,13 @@ def build_card(parsed, meta=None) -> Card:
     if not meta.family:
         meta.family = metadata.guess_family(meta.part)
 
+    # Why is this card thin? Measured, not guessed: `flags` are what the PDF
+    # actually gave us, and quality.py turns them into something a human reads.
+    text_chars = sum(len(p.text or "") for p in pages)
+    n_tables = sum(len(p.tables) for p in pages)
+    flags = quality.parse_flags(text_chars, parsed.n_pages, n_tables,
+                                part_from_meta=bool(meta.part))
+
     sources = {
         "description": desc_page, "features": feat_page if features else None,
         "applications": app_page if applications else None,
@@ -930,4 +939,6 @@ def build_card(parsed, meta=None) -> Card:
         confidence=confidence,
         sources={k: v for k, v in sources.items() if v},
         extracted_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        text_chars=text_chars,
+        flags=flags,
     )

@@ -1189,6 +1189,11 @@
     });
   }
 
+  /* Every card renders the same four rows — part, facts, description,
+     parameters — even when the PDF gave us nothing. A grid where some cards
+     have a package chip and some have no chip at all reads as a broken
+     parser; a grid where the missing chip says "package unknown" reads as
+     an honest datasheet that never named its package. */
   function renderCards(items, reset) {
     if (!items.length && reset) {
       el.cardGrid.innerHTML = '<div class="rag-none">Nothing found. Try a shorter query.</div>';
@@ -1199,6 +1204,14 @@
       var specs = (c.headline || []).slice(0, 4).map(function (h) {
         return '<span class="spec-chip">' + esc(h.label) + ' <b>' + esc(h.text) + '</b></span>';
       }).join('');
+      var chips = [
+        c.package ? '<span class="pcard-chip">' + esc(c.package) + '</span>' : ghost('package unknown'),
+        c.pin_count ? '<span class="pcard-chip">' + c.pin_count + ' pins</span>' : ghost('no pinout'),
+        c.family ? '<span class="pcard-chip">' + esc(c.family) + '</span>' : '',
+        c.pages ? '<span class="pcard-chip">' + c.pages + ' pages</span>' : ''
+      ].filter(Boolean).join('');
+      var flags = c.flags || [];
+      var warn = flagChip(flags);
       return '<article class="pcard" data-card="' + esc(c.part) + '">' +
         '<div class="pcard-head">' +
           '<span class="pcard-part">' + esc(c.part) + '</span>' +
@@ -1206,18 +1219,36 @@
           '<span class="pcard-badge ' + cls + '">' +
             Math.round((c.confidence || 0) * 100) + '% extracted</span>' +
         '</div>' +
-        '<div class="pcard-chips">' +
-          (c.package ? '<span class="pcard-chip">' + esc(c.package) + '</span>' : '') +
-          (c.pin_count ? '<span class="pcard-chip">' + c.pin_count + ' pins</span>' : '') +
-          (c.family ? '<span class="pcard-chip">' + esc(c.family) + '</span>' : '') +
-          (c.pages ? '<span class="pcard-chip">' + c.pages + ' pages</span>' : '') +
-        '</div>' +
-        (c.description ? '<div class="pcard-desc">' + esc(c.description) + '</div>' : '') +
-        (specs ? '<div class="pcard-specs">' + specs + '</div>' : '') +
+        '<div class="pcard-chips">' + chips + warn + '</div>' +
+        '<div class="pcard-desc' + (c.description ? '' : ' pcard-none') + '">' +
+          (c.description ? esc(c.description) : 'No description found in this datasheet') + '</div>' +
+        '<div class="pcard-specs">' +
+          (specs || ghost('no parameters extracted')) + '</div>' +
         '<div class="pcard-foot">' + esc(c.filename || '') + '</div>' +
       '</article>';
     }).join('');
     el.cardGrid.innerHTML = reset ? html : el.cardGrid.innerHTML + html;
+  }
+
+  function ghost(text) {
+    return '<span class="pcard-chip pcard-chip-ghost">' + esc(text) + '</span>';
+  }
+
+  /* Why this card is thin. Flags are measured at parse time (no text layer,
+     no tables); the wording here is what the engineer sees, so it says what
+     to do about it, not just that something went wrong. */
+  var FLAG_CHIP = {
+    scan: 'scan — no text layer',
+    low_text: 'almost no text',
+    no_tables: 'no tables found'
+  };
+  function flagChip(flags) {
+    for (var i = 0; i < flags.length; i++) {
+      if (FLAG_CHIP[flags[i]]) {
+        return '<span class="pcard-chip pcard-chip-warn">' + esc(FLAG_CHIP[flags[i]]) + '</span>';
+      }
+    }
+    return '';
   }
 
   function openCard(part) {
@@ -1237,6 +1268,23 @@
     el.cardModal.classList.add('hidden');
   }
 
+  function cardNotice(c) {
+    var flags = c.flags || [];
+    if (flags.indexOf('scan') >= 0) {
+      return 'This PDF has no text layer — it is a scan, so almost nothing could be '
+        + 'extracted. Re-run this file through Docling with OCR to fill the card in.';
+    }
+    if (flags.indexOf('low_text') >= 0) {
+      return 'Only a few hundred characters of text could be read from this PDF. '
+        + 'It is probably a drawing or a scan — OCR would recover the rest.';
+    }
+    if (flags.indexOf('no_tables') >= 0) {
+      return 'No tables were recognised in this PDF. Pinout and electrical '
+        + 'parameters live in tables, so this card is thin until the tables parse.';
+    }
+    return '';
+  }
+
   function renderCardFull(c) {
     var out = '';
     out += '<div class="card-full-head">' +
@@ -1247,6 +1295,9 @@
       '<span class="pcard-badge ' + (c.confidence >= 0.8 ? 'good' : c.confidence >= 0.5 ? 'mid' : 'low') +
         '">' + Math.round((c.confidence || 0) * 100) + '% extracted</span>' +
     '</div>';
+
+    var notice = cardNotice(c);
+    if (notice) out += '<div class="card-notice">' + esc(notice) + '</div>';
 
     if (c.description) out += '<div class="pcard-desc" style="font-size:14px">' + esc(c.description) + '</div>';
 
