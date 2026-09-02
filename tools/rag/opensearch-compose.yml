@@ -1,0 +1,69 @@
+# OpenSearch on the same machine — one node, no cluster.
+#
+#   docker compose -f tools/rag/opensearch-compose.yml up -d
+#   curl http://localhost:9200
+#   SMD_OPENSEARCH_URL=http://localhost:9200 python3 tools/rag/pipeline.py --rebuild
+#
+# Tested shape: 128 GB RAM, one index of a few million chunks. The heap is
+# 8 GB because OpenSearch wants heap for the k-NN graphs and off-heap for the
+# page cache; on a smaller machine lower OPENSEARCH_JAVA_OPTS to half of RAM.
+#
+# Security is disabled on purpose: this node listens on localhost and holds no
+# secrets. If you expose it, turn the security plugin back on and set
+# OPENSEARCH_INITIAL_ADMIN_PASSWORD.
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.19.0
+    container_name: smd-opensearch
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - cluster.name=smd-datasheets
+      - node.name=smd-1
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms8g -Xmx8g
+      # k-NN: HNSW needs heap. Leave room for the file system cache, which is
+      # what actually serves the vectors.
+      - knn.memory.circuit_breaker.limit=60%
+      - indices.memory.index_buffer_size=20%
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "127.0.0.1:9200:9200"
+      - "127.0.0.1:9600:9600"      # performance analyzer
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  # Optional UI: docker compose --profile ui up -d
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:2.19.0
+    container_name: smd-dashboards
+    profiles: ["ui"]
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "127.0.0.1:5601:5601"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  opensearch-data:
+
+# Before the first start, on the host:
+#   sudo sysctl -w vm.max_map_count=262144
+#   echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-opensearch.conf
