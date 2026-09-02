@@ -76,7 +76,15 @@ def process_one(path_str: str) -> Dict[str, Any]:
     started = time.time()
     try:
         from tools.rag import metadata
-        parsed = _PARSER.parse(path)
+        try:
+            parsed = _PARSER.parse(path)
+        except Exception:                         # noqa: BLE001 - see below
+            # Docling that cannot read one file must not cost us the card:
+            # a missing OCR engine or a corrupt page is a property of the PDF,
+            # not of the run. pdfplumber gets the second look.
+            if getattr(_PARSER, "name", "") != "docling":
+                raise
+            parsed = parsers.get_parser("pdfplumber").parse(path)
         meta = metadata.enrich(parsed)
         card = extract.build_card(parsed, meta)
         data = card.to_dict()
@@ -91,6 +99,48 @@ def process_one(path_str: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # driver
 # ---------------------------------------------------------------------------
+
+def parser_breakdown(db: Path) -> List[tuple]:
+    """How many cards came from Docling and how many from the fallback.
+
+    This is the number that settles "Docling is useless": if you asked for
+    Docling and 845 of 854 cards say pdfplumber, Docling was never actually
+    used — on a scan the old `pages=tables` path dropped straight back to
+    pdfplumber because it found no tables in a document with no text.
+    """
+    try:
+        con = sqlite3.connect(str(db))
+        try:
+            rows = con.execute(
+                "SELECT COALESCE(NULLIF(parser, ''), '?') p, COUNT(*) n "
+                "FROM cards GROUP BY p ORDER BY n DESC").fetchall()
+        finally:
+            con.close()
+        return [(r[0], r[1]) for r in rows]
+    except Exception:                             # noqa: BLE001 - reporting only
+        return []
+
+
+def print_parser_breakdown(db: Path) -> None:
+    rows = parser_breakdown(db)
+    if not rows:
+        return
+    print("\nЧем разобрано")
+    for name, n in rows:
+        mark = ""
+        if name == "pdfplumber":
+            mark = "   (фолбэк: Docling не справился или не установлен)"
+        elif name == "docling":
+            mark = "   (Docling)"
+        print("  %-14s %8d%s" % (name, n, mark))
+    for err in _last_docling_errors():
+        print("  ! %s" % err)
+
+
+def _last_docling_errors() -> List[str]:
+    """Why Docling refused, if it did. Printed once, not 854 times."""
+    return list(getattr(parsers.DoclingParser, "ISSUES", [])[-5:])
+
 
 def _fmt_eta(seconds: float) -> str:
     if seconds <= 0 or seconds > 60 * 60 * 200:
@@ -180,6 +230,7 @@ def build(corpus: Path, out: Path, parser_name: str = "auto", jobs: int = 0,
     store = card_store.CardStore(out / "cards.db")
     stats = store.stats()
     store.close()
+    print_parser_breakdown(out / "cards.db")
     return stats
 
 
@@ -193,6 +244,7 @@ def print_stats(out: Path) -> None:
     print("  with ratings:   %d" % s["with_ratings"])
     print("  avg confidence: %.2f" % s["avg_confidence"])
     print("  failures:       %d" % s["failures"])
+    print_parser_breakdown(out / "cards.db")
     facets = store.facets()
     if facets["packages"]:
         print("\nTop packages:")

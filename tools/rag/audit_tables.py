@@ -36,6 +36,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_CORPUS = Path(os.environ.get("SMD_DATA_DIR") or (ROOT / "data")) / "datasheets"
 
 KIND_RU = {
+    "registers": "регистры МК (распознаны и отброшены)",
     "pins": "распиновка",
     "ratings": "предельные режимы",
     "electrical": "электрические характеристики",
@@ -119,7 +120,13 @@ def audit(pdf_paths: List[Path], top: int = 25, examples: int = 3,
         "docs_without_tables": docs_without_tables,
         "tables": tables_total,
         "kinds": dict(kinds),
-        "recognised": sum(kinds.values()),
+        # Recognised on purpose and then dropped: register maps and the like.
+        # They are not failures — counting them as "распознано" would flatter
+        # the number, counting them as "не распознано" would hide the fix.
+        "ignored": sum(n for k, n in kinds.items() if k in extract.IGNORED_KINDS),
+        "recognised": sum(n for k, n in kinds.items() if k not in extract.IGNORED_KINDS),
+        # `unknown` is truncated to `--top` for printing; the total is not.
+        "unknown_total": sum(unknown.values()),
         "unknown": unknown.most_common(top),
         "unknown_examples": unknown_examples,
         "pin_shaped_caught": pin_shaped_caught,
@@ -145,11 +152,19 @@ def report(result: Dict[str, Any], top: int) -> List[str]:
             lines.append("  %-30s %6d  %5.1f%%"
                          % (KIND_RU.get(kind, kind), n, 100.0 * n / max(1, tables)))
 
-    unknown_total = sum(n for _fp, n in result["unknown"])
+    ignored = result.get("ignored", 0)
+    if ignored:
+        lines.append("")
+        lines.append("Распознано и отброшено (в карточку не идёт): %d (%.1f%%)"
+                     % (ignored, 100.0 * ignored / max(1, tables)))
+
+    unknown_total = result.get("unknown_total") or sum(n for _fp, n in result["unknown"])
     if unknown_total:
         lines.append("")
-        lines.append("НЕ распознано: %d таблиц (%.1f%%). Частые заголовки:"
-                     % (unknown_total, 100.0 * unknown_total / max(1, tables)))
+        lines.append("НЕ распознано: %d таблиц (%.1f%%). Частые заголовки "
+                     "(показаны первые %d):"
+                     % (unknown_total, 100.0 * unknown_total / max(1, tables),
+                        len(result["unknown"])))
         for i, (fp, n) in enumerate(result["unknown"][:top], 1):
             lines.append("  %2d. [%4d×] %s" % (i, n, fp))
         lines.append("")

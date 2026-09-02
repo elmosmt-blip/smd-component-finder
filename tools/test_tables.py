@@ -101,6 +101,33 @@ def main() -> int:
     check("одна строка — не таблица",
           extract.classify_table([["Pin", "Name"]]) is None)
 
+    print("\n--- регистры МК: распознаются, чтобы быть отброшенными ---")
+    # Половина даташита на микроконтроллер — это карта регистров. В аудите
+    # 50 файлов они дали 385 "нераспознанных" таблиц и забили весь вывод.
+    REG_ROWS = (["bit 7", "gie", "rw-0"], ["bit 6", "peie", "rw-0"])
+    check("Core Registers Tab",
+          kind_of(["Core Registers Tab"], *REG_ROWS) == "registers")
+    check("Name / intcon / bit 7 gie",
+          kind_of(["Name", "intcon", "bit 7 gie"], *REG_ROWS) == "registers")
+    check("Name / config1 / bits 13 8",
+          kind_of(["Name", "config1", "bits 13 8"], *REG_ROWS) == "registers")
+    check("0x0F / bit 7 / reset",
+          kind_of(["0x0F", "bit 7", "reset"], *REG_ROWS) == "registers")
+    check("SFR / address / reset",
+          kind_of(["SFR", "address", "reset"], *REG_ROWS) == "registers")
+    check("распиновка НЕ уходит в регистры",
+          kind_of(["Pin", "Name", "Function"], *PIN_ROWS) == "pins")
+    check("электрика НЕ уходит в регистры",
+          kind_of(["Symbol", "Parameter", "Min", "Typ", "Max", "Unit"],
+                  ["VCEO", "Collector-emitter voltage", " ", " ", "40", "V"])
+          == "electrical")
+    check("счётчик регистров молчит на обычных заголовках",
+          extract._register_score(["pin", "name", "function"]) == 0,
+          str(extract._register_score(["pin", "name", "function"])))
+    check("одинокое слабое слово не делает таблицу регистрами",
+          extract._register_score(["name", "type"]) < 2,
+          str(extract._register_score(["name", "type"])))
+
     print("\n--- распиновка по форме, без заголовка ---")
     bare = [["1", "Base", "Control input"], ["2", "Emitter", "Ground"],
             ["3", "Collector", "Output"]]

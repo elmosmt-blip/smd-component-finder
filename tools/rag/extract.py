@@ -234,6 +234,13 @@ HEADLINE = [
 # is "Pin / Name / Function" at one vendor, "Terminal No. / Symbol / I-O" at
 # another and a bare "1 Base 2 Emitter" at a third. Every time a real corpus
 # turned out thin, it was a word missing from this list, not a missing feature.
+# Kinds we recognise only in order to ignore them. A microcontroller
+# datasheet is half register maps: "Core Registers", "INTCON | bit 7 GIE",
+# "0x0F". They are tables, they are not the pinout, and if they stay
+# unrecognised they clog up audit_tables.py forever and occasionally get
+# stolen by a looser rule. Recognise them by name, then drop them.
+IGNORED_KINDS = frozenset({"registers"})
+
 TABLE_KINDS = [
     ("pins",
      ("pin", "pinout", "terminal", "pad", "ball", "lead", "conn"),
@@ -413,6 +420,35 @@ def _shape_is_pins(table: List[List[str]]) -> bool:
                    re.search(r"\d", c) and c.count(".") > 1 for c in others)
 
 
+# A register map: "Core Registers", "INTCON | bit 7 GIE", "Name | config1 |
+# bits 13-8", "0x0F". Half of a microcontroller datasheet is these, they are
+# not the pinout, and they are close enough to an ordering table
+# ("Name | Code") to get misread as one. So they are recognised first and
+# then dropped — see IGNORED_KINDS.
+#
+# Deliberately *not* a vocabulary entry: the words that show up in these
+# headers ("name", "type", "function", "value") are the same words a pinout
+# uses, and a must/also pair built from them steals real pin tables. A score
+# with a strong/weak split does not.
+_REGISTER_STRONG = re.compile(
+    r"\b(registers?|sfr|intcon|config\d*|0x[0-9a-fA-F]{1,4})\b")
+_REGISTER_WEAK = re.compile(
+    r"\b(bits?\s*\d*|reset|rw|r/w|default|address|offset|field|por)\b")
+
+
+def _register_score(cells: List[str]) -> int:
+    """How sure we are that this header belongs to a register map."""
+    score = 0
+    for cell in cells:
+        if not cell:
+            continue
+        if _REGISTER_STRONG.search(cell):
+            score += 2
+        elif _REGISTER_WEAK.search(cell):
+            score += 1
+    return score
+
+
 def classify_table(table: List[List[str]]) -> Optional[Tuple[str, Dict[str, int], int]]:
     """Return (kind, {column_name: index}, header_rows) if the header is recognised."""
     if not table or len(table) < 2:
@@ -426,6 +462,9 @@ def classify_table(table: List[List[str]]) -> Optional[Tuple[str, Dict[str, int]
     for cells, rows_used in candidates:
         if sum(1 for c in cells if c) < 2:
             continue
+        if _register_score(cells) >= 2:
+            # Recognised, then ignored: no columns, nothing is extracted.
+            return "registers", {}, rows_used
         for kind, must, also in TABLE_KINDS:
             if not any(_cell_has(cells, m) for m in must):
                 continue
@@ -743,7 +782,7 @@ def extract_pins(pages: List[Any]) -> Tuple[List[dict], Optional[int]]:
     for page in pages:
         for table in page.tables:
             kind = classify_table(table)
-            if not kind or kind[0] != "pins":
+            if not kind or kind[0] != "pins" or kind[0] in IGNORED_KINDS:
                 continue
             _, cols, header_rows = kind
             pins: List[dict] = []
@@ -778,7 +817,7 @@ def _rows_from(pages: List[Any], kind_wanted: str) -> List[Tuple[int, dict, List
     for page in pages:
         for table in page.tables:
             kind = classify_table(table)
-            if not kind or kind[0] != kind_wanted:
+            if not kind or kind[0] != kind_wanted or kind[0] in IGNORED_KINDS:
                 continue
             _, cols, header_rows = kind
             for row in table[header_rows:]:

@@ -131,7 +131,9 @@ def build_corpus(folder: Path) -> Path:
 def parser_with(converter: _FakeConverter, **kwargs) -> parsers.DoclingParser:
     p = parsers.DoclingParser(**kwargs)
     p.is_available = lambda: True                      # noqa: E731
-    p._converter = lambda: converter                   # noqa: E731
+    # _converter takes do_ocr: the OCR pipeline is a different engine, so the
+    # cache key carries it and the test double has to accept the argument.
+    p._converter = lambda do_ocr=False: converter       # noqa: E731
     return p
 
 
@@ -247,6 +249,52 @@ def main() -> int:
         check("markdown всего документа", "Features" in whole.markdown
               and "Pinning" in whole.markdown)
 
+        print("\n--- сканы: Docling обязана вызываться, даже если таблиц нет ---")
+        scan = _make_scan(tmp / "scan.pdf")
+        base_scan = parsers.PdfPlumberParser().parse(scan)
+        check("в скане pdfplumber не видит текста",
+              sum(len(pg.text or "") for pg in base_scan.pages) == 0,
+              str([pg.text for pg in base_scan.pages])[:80])
+
+        docs_scan = {1: _FakeDoc(pages={1: "# SCAN123"}, tables=[
+            TableItem(1, ["Pin", "Name"], [["1", "Base"]])])}
+        conv_scan = _FakeConverter(docs_scan)
+        p_auto = parser_with(conv_scan, pages="tables", ocr="auto")
+        got = p_auto.parse(scan)
+        check("OCR=auto: скан ушёл в Docling, хотя таблиц не найдено",
+              len(conv_scan.calls) >= 1, str(conv_scan.calls))
+        check("OCR=auto: скан разобран Docling, а не отдан пустым pdfplumber",
+              got.parser == "docling", got.parser)
+
+        conv_off = _FakeConverter(docs_scan)
+        p_off = parser_with(conv_off, pages="tables", ocr="off")
+        got_off = p_off.parse(scan)
+        check("OCR=off: Docling не вызывается совсем",
+              conv_off.calls == [], str(conv_off.calls))
+        check("OCR=off: скан остаётся pdfplumber-результатом",
+              got_off.parser == "pdfplumber", got_off.parser)
+
+        conv_native = _FakeConverter(docs_scan)
+        p_native = parser_with(conv_native, pages="tables", ocr="on")
+        p_native.parse(pdf)
+        check("OCR=on: обычный PDF с текстом тоже идёт через Docling",
+              len(conv_native.calls) >= 1, str(conv_native.calls))
+
+        check("решение по OCR принимается по текстовому слою",
+              p_auto._ocr_decision(base_scan) is True
+              and p_auto._ocr_decision(base) is False,
+              "%s / %s" % (p_auto._ocr_decision(base_scan),
+                           p_auto._ocr_decision(base)))
+
+        failing = _FakeConverter(docs_scan, fail=True)
+        p_fail = parser_with(failing, pages="tables", ocr="auto")
+        got_fail = p_fail.parse(scan)
+        check("OCR упал — скан не потерян, остаётся pdfplumber",
+              got_fail.parser == "pdfplumber", got_fail.parser)
+        check("причина записана, чтобы её можно было показать один раз",
+              bool(parsers.DoclingParser.ISSUES),
+              str(parsers.DoclingParser.ISSUES[-1:]))
+
         print("\n--- настройки и кэш конвертера ---")
         p_default = parsers.DoclingParser()
         check("по умолчанию — только страницы с таблицами",
@@ -256,7 +304,9 @@ def main() -> int:
         check("потоки на процесс ограничены",
               p_default.threads <= 8, str(p_default.threads))
         parsers.DoclingParser._CONVERTERS.clear()
-        key = ("tables", "fast", "auto", 2)
+        # The key carries do_ocr: the OCR pipeline is a separate engine and a
+        # separate warm converter.
+        key = ("tables", "fast", "auto", 2, False)
         sentinel = object()
         parsers.DoclingParser._CONVERTERS[key] = sentinel
         check("конвертер переиспользуется, а не создаётся на каждый PDF",
@@ -290,6 +340,26 @@ def main() -> int:
         print("(docling не установлен — проверена маршрутизация и устойчивость, "
               "а не сами модели)")
     return 1 if FAIL else 0
+
+
+def _make_scan(path: Path) -> Path:
+    """A one-page PDF with a drawn box and not a single text operator.
+
+    This is what a scanned datasheet looks like to pdfplumber: geometry,
+    no characters. It is the case the old `pages="tables"` path threw away —
+    "no tables found, nothing for Docling to do" — which is why a Docling run
+    over 854 scans came back with eight Docling cards.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    c = canvas.Canvas(str(path), pagesize=A4)
+    c.rect(120, 400, 300, 200, fill=0)
+    c.line(120, 380, 420, 380)
+    c.showPage()
+    c.save()
+    return path
 
 
 def _docling_installed() -> bool:

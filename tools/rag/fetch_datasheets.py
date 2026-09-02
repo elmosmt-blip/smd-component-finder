@@ -423,6 +423,48 @@ def probe_cache(db_path: Path, columns: int = 40) -> dict:
         out["error"] = str(exc)
     finally:
         con.close()
+    out["splits"] = _probe_splits(db_path, out["tables"])
+    return out
+
+
+def _probe_splits(db_path: Path, tables: List[dict]) -> List[tuple]:
+    """How many rows survive each filter, on the biggest table.
+
+    This is the measurement people end up doing by hand: "--basic-only gave
+    me 974 rows out of 7.1 million, why?". Answer: in the v2 cache there is
+    no `basic` column at all, so the exporter falls back to `preferred`, and
+    `preferred` is not the flag it sounds like — there are about a thousand
+    of them.
+    """
+    if not tables:
+        return []
+    main = max(tables, key=lambda t: t["rows"] if t["rows"] > 0 else -1)
+    cols = set(main["columns"])
+    if not cols:
+        return []
+    import sqlite3
+    out: List[tuple] = []
+    con = sqlite3.connect(str(db_path))
+    try:
+        for column in ("basic", "preferred"):
+            if column in cols:
+                n = con.execute("SELECT COUNT(*) FROM %s WHERE %s = 1"
+                                % (main["name"], column)).fetchone()[0]
+                out.append(("%s = 1" % column, n))
+        if "library_type" in cols:
+            for value, n in con.execute(
+                    "SELECT library_type, COUNT(*) FROM %s GROUP BY library_type"
+                    % main["name"]).fetchall():
+                out.append(("library_type = %s" % value, n))
+        if "datasheet" in cols:
+            n = con.execute(
+                "SELECT COUNT(*) FROM %s WHERE TRIM(COALESCE(datasheet, '')) != ''"
+                % main["name"]).fetchone()[0]
+            out.append(("есть ссылка на PDF", n))
+    except sqlite3.Error:
+        return out
+    finally:
+        con.close()
     return out
 
 
@@ -436,10 +478,26 @@ def print_probe(db_path: Path, probe: dict) -> None:
         print("  %-22s %-6s %s" % (table["name"], table["kind"], rows))
         if table["columns"]:
             print("      колонки: %s" % ", ".join(table["columns"]))
+    if probe.get("splits"):
+        print("")
+        print("Сколько строк даёт каждый фильтр")
+        for label, n in probe["splits"]:
+            print("  %-28s %d" % (label + ":", n))
+        labels = [label for label, _n in probe["splits"]]
+        if "basic = 1" not in labels and "preferred = 1" in labels:
+            print("")
+            print("  [!] колонки `basic` здесь нет — это v2-схема каталога.")
+            print("      --basic-only будет фильтровать по `preferred`, и это "
+                  "около тысячи строк,")
+            print("      а не миллион. Для корпуса: без --basic-only, "
+                  "с --min-stock и --popular-first.")
+
     print("")
     print("Дальше:")
     print("  python3 tools/rag/fetch_datasheets.py --from-jlcparts %s --to-csv parts.csv"
           % db_path)
+    print("  python3 tools/rag/fetch_datasheets.py --from-jlcparts %s \\" % db_path)
+    print("      --to-csv parts.csv --min-stock 100 --popular-first --dedupe --limit 50000")
 
 
 def manifest_report(path: Path, top: int = 10) -> dict:
@@ -620,7 +678,9 @@ def _fmt_lcsc(value: Any) -> str:
 def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "",
                        basic_only: bool = False, min_stock: int = 0,
                        category: str = "", limit: int = 0,
-                       prefer_vendor: bool = False, verbose: bool = False) -> int:
+                       prefer_vendor: bool = False, verbose: bool = False,
+                       popular_first: bool = False, dedupe: bool = False,
+                       library_type: str = "", explain: bool = True) -> int:
     """Turn a parts database (jlcparts and friends) into a part list CSV.
 
     `prefer_vendor` is the interesting one. The catalogue links mostly point
@@ -684,12 +744,30 @@ def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "",
             mfr_col = "mn.name"
         lcsc_col = pick(("lcsc", "lcsc_part"))
 
+        # Every filter is one stage of a funnel, and each stage is counted.
+        # "The export gave me 974 rows out of 7.1 million" is the single most
+        # confusing thing about this catalogue, and the answer is always
+        # "one of the filters is much narrower than you think" — usually
+        # `--basic-only`, which in the v2 cache has no `basic` column to work
+        # with and quietly filters on `preferred` instead (1 000 rows).
+        stages: List[tuple] = []
         where, args = [], []
         where.append("TRIM(COALESCE(p.%s, '')) != ''" % url_col)
+        stages.append(("есть ссылка на PDF", where[-1], []))
+        if library_type:
+            if "library_type" in cols:
+                where.append("p.library_type = ?")
+                args.append(library_type)
+                stages.append(("library_type = %s" % library_type, where[-1],
+                               [library_type]))
+            else:
+                print("warning: no library_type column, --library-type ignored")
         if basic_only:
             flags = [c for c in ("basic", "preferred") if c in cols]
             if flags:
                 where.append("(" + " OR ".join("p.%s = 1" % c for c in flags) + ")")
+                stages.append(("basic/preferred = 1 (%s)" % "+".join(flags),
+                               where[-1], []))
             else:
                 print("warning: no basic/preferred column, --basic-only ignored")
         if min_stock:
@@ -697,6 +775,8 @@ def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "",
             if stock_col:
                 where.append("COALESCE(p.%s, 0) >= ?" % stock_col)
                 args.append(min_stock)
+                stages.append(("склад >= %d" % min_stock, where[-1], [min_stock]))
+        stock_col = pick(("stock", "last_on_stock", "quantity"))
         if category:
             like = "%%%s%%" % category
             cat_cols = [c for c in ("category", "subcategory") if c in cols]
@@ -719,9 +799,52 @@ def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "",
         if lcsc_col and lcsc_col != part_col:
             select.append("p.%s AS lcsc" % lcsc_col)
 
-        sql = ("SELECT DISTINCT %s FROM %s p%s WHERE %s%s"
-               % (", ".join(select), source, joins, " AND ".join(where),
+        # --dedupe: one row per datasheet URL. Forty parts of a resistor series
+        # share one PDF, and downloading it forty times is where 58 % of the
+        # attempts in a real run went — the SHA1 dedupe caught them at write
+        # time, but the HTTP traffic had already happened.
+        # --popular-first: the most-stocked parts first, so `--limit 50000`
+        # takes the 50 000 people actually buy instead of 50 000 in row order.
+        grouped = dedupe or popular_first
+        group_key = "p.%s" % (url_col if dedupe else part_col)
+        if grouped and stock_col:
+            select.append("MAX(COALESCE(p.%s, 0)) AS stock" % stock_col)
+        tail = ""
+        if grouped:
+            tail += " GROUP BY %s" % group_key
+            if stock_col:
+                tail += " ORDER BY stock DESC"
+        sql = ("SELECT %s%s FROM %s p%s WHERE %s%s%s"
+               % ("DISTINCT " if not grouped else "", ", ".join(select), source,
+                  joins, " AND ".join(where), tail,
                   " LIMIT %d" % limit if limit else ""))
+
+        if explain:
+            print("Источник: %s" % source)
+            total = con.execute("SELECT COUNT(*) FROM %s" % source).fetchone()[0]
+            print("  строк всего:            %d" % total)
+            acc_where: List[str] = []
+            acc_args: List[Any] = []
+            for label, clause, cargs in stages:
+                acc_where.append(clause)
+                acc_args.extend(cargs)
+                n = con.execute(
+                    "SELECT COUNT(*) FROM %s p%s WHERE %s"
+                    % (source, joins, " AND ".join(acc_where)), acc_args).fetchone()[0]
+                print("  %-24s %d" % (label + ":", n))
+                if n == 0:
+                    print("    ! на этом фильтре всё обнулилось — снимите его")
+            if grouped:
+                n = con.execute("SELECT COUNT(*) FROM (SELECT 1 FROM %s p%s "
+                                "WHERE %s GROUP BY %s)"
+                                % (source, joins, " AND ".join(where), group_key),
+                                args).fetchone()[0]
+                print("  %-24s %d" % ("после GROUP BY %s:" % group_key, n))
+            if basic_only and "basic" not in cols and "preferred" in cols:
+                print("  ! колонки `basic` в этой версии кэша нет: --basic-only "
+                      "фильтрует по `preferred`, а таких строк ~1000.")
+                print("    Для корпуса запускайте без --basic-only, с --min-stock "
+                      "и --popular-first.")
         rows = con.execute(sql, args).fetchall()
     finally:
         con.close()
@@ -781,6 +904,16 @@ def main() -> int:
     ap.add_argument("--basic-only", action="store_true",
                     help="JLCPCB basic/preferred parts only")
     ap.add_argument("--min-stock", type=int, default=0)
+    ap.add_argument("--popular-first", action="store_true",
+                    help="sort by stock descending, so --limit takes the parts "
+                         "people actually order instead of the first N rows")
+    ap.add_argument("--dedupe", action="store_true",
+                    help="one row per datasheet URL — a 40-part series shares "
+                         "one PDF and does not need 40 downloads")
+    ap.add_argument("--library-type", default="",
+                    help="base | expand, if the cache has that column")
+    ap.add_argument("--no-explain", action="store_true",
+                    help="skip the row-count funnel (faster on an 11 GB cache)")
     ap.add_argument("--category", default="", help="substring of the category name")
     ap.add_argument("--prefer-vendor", action="store_true",
                     help="link to the manufacturer's own PDF instead of the "
@@ -827,6 +960,10 @@ def main() -> int:
                                basic_only=args.basic_only,
                                min_stock=args.min_stock, category=args.category,
                                limit=args.limit, prefer_vendor=args.prefer_vendor,
+                               popular_first=args.popular_first,
+                               dedupe=args.dedupe,
+                               library_type=args.library_type,
+                               explain=not args.no_explain,
                                verbose=True)
         print("Next: python3 tools/rag/fetch_datasheets.py --list %s "
               "--out %s --dry-run" % (target, args.out))

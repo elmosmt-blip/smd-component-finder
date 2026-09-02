@@ -72,7 +72,7 @@ REM 3. посмотреть, что получилось
 
 ```bat
 REM список деталей из скачанного каталога
-.venv\Scripts\python tools\rag\fetch_datasheets.py --from-jlcparts C:\smd-corpus\cache.sqlite3 --to-csv parts.csv --basic-only --min-stock 100
+.venv\Scripts\python tools\rag\fetch_datasheets.py --from-jlcparts C:\smd-corpus\cache.sqlite3 --to-csv parts.csv --min-stock 100 --popular-first --dedupe --prefer-vendor
 
 REM скачать даташиты по списку
 .venv\Scripts\python tools\rag\fetch_datasheets.py --list parts.csv --out C:\smd-corpus\pdf --workers 16 --delay 0.2
@@ -80,6 +80,13 @@ REM скачать даташиты по списку
 
 Плюс: объём. Минус: качество ниже — много сканов, и 58 % файлов оказываются
 копиями друг друга.
+
+**Ловушка `--basic-only`.** В актуальной (v2) версии кэша колонки `basic`
+нет — есть `preferred`, а строк с `preferred=1` около тысячи на 7.1 млн.
+Выгрузка с `--basic-only --min-stock 100` даёт **974 строки**, и это не
+«мало деталей», а «фильтр схлопнулся». Экспорт теперь печатает воронку по
+каждому фильтру, `--no-explain` её отключает, а `--probe cache.sqlite3`
+показывает те же цифры до всякой выгрузки.
 
 ### 2. Сайты производителей — качество
 

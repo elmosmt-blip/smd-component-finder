@@ -18,6 +18,7 @@ one was used.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import threading
@@ -93,7 +94,16 @@ class DoclingParser(BaseParser):
         SMD_DOCLING_TABLE_MODE  fast | accurate       (default: fast)
         SMD_DOCLING_DEVICE      auto | cpu | cuda     (default: auto)
         SMD_DOCLING_THREADS     threads per worker    (default: 2)
+        SMD_DOCLING_OCR         off | on | auto       (default: auto)
         DOCLING_ARTIFACTS_PATH  where the weights live (Docling's own variable)
+
+    OCR is the whole point of Docling on a scanned datasheet, and `auto` is
+    the default because it is free everywhere else: OCR is switched on only
+    for files where pdfplumber found no text layer, so a native PDF never
+    pays for it and a scan still gets one. Docling needs an OCR engine
+    installed (tesseract or easyocr); if it is missing the conversion raises
+    and the caller falls back to pdfplumber, which is where the scan was
+    before — no worse, and the reason is printed.
     """
 
     name = "docling"
@@ -104,12 +114,16 @@ class DoclingParser(BaseParser):
     _CONVERTER_LOCK = threading.Lock()
 
     def __init__(self, pages: Optional[str] = None, table_mode: Optional[str] = None,
-                 device: Optional[str] = None, threads: int = 0):
+                 device: Optional[str] = None, threads: int = 0,
+                 ocr: Optional[str] = None):
         self.pages = (pages or os.environ.get("SMD_DOCLING_PAGES") or "tables").lower()
         self.table_mode = (table_mode or os.environ.get("SMD_DOCLING_TABLE_MODE")
                            or "fast").lower()
         self.device = device or os.environ.get("SMD_DOCLING_DEVICE") or "auto"
         self.threads = int(threads or os.environ.get("SMD_DOCLING_THREADS") or 2)
+        self.ocr = (ocr or os.environ.get("SMD_DOCLING_OCR") or "auto").lower()
+        if self.ocr not in ("off", "on", "auto"):
+            self.ocr = "auto"
 
     # ------------------------------------------------------------- availability
 
@@ -125,7 +139,7 @@ class DoclingParser(BaseParser):
 
     # --------------------------------------------------------------- docling io
 
-    def _options(self):
+    def _options(self, do_ocr: bool = False):
         from docling.datamodel.pipeline_options import (
             AcceleratorOptions, PdfPipelineOptions, TableFormerMode)
 
@@ -133,7 +147,7 @@ class DoclingParser(BaseParser):
         # Tables are the whole point; page images are not — they cost time and
         # gigabytes on a 300k run and we never look at them.
         opts.do_table_structure = True
-        opts.do_ocr = False
+        opts.do_ocr = bool(do_ocr)
         opts.generate_page_images = False
         opts.generate_picture_images = False
         try:
@@ -152,22 +166,27 @@ class DoclingParser(BaseParser):
             pass
         return opts
 
-    def _converter(self):
-        key = (self.pages, self.table_mode, self.device, self.threads)
+    def _converter(self, do_ocr: bool = False):
+        # The OCR pipeline is a different engine instance, so it is a
+        # different cache key: a native PDF and a scan each get one warm
+        # converter per worker, not one that is rebuilt on every file.
+        key = (self.pages, self.table_mode, self.device, self.threads, bool(do_ocr))
         with self._CONVERTER_LOCK:
             conv = self._CONVERTERS.get(key)
             if conv is None:
+                quiet_docling()
                 from docling.datamodel.base_models import InputFormat
                 from docling.document_converter import DocumentConverter, PdfFormatOption
                 conv = DocumentConverter(format_options={
-                    InputFormat.PDF: PdfFormatOption(pipeline_options=self._options())
+                    InputFormat.PDF: PdfFormatOption(
+                        pipeline_options=self._options(do_ocr))
                 })
                 self._CONVERTERS[key] = conv
             return conv
 
-    def _convert(self, path: Path, page_range=None):
+    def _convert(self, path: Path, page_range=None, do_ocr: bool = False):
         kwargs = {"page_range": page_range} if page_range else {}
-        return self._converter().convert(str(path), **kwargs)
+        return self._converter(do_ocr).convert(str(path), **kwargs)
 
     @staticmethod
     def _table_rows(item, doc) -> List[List[str]]:
@@ -229,16 +248,48 @@ class DoclingParser(BaseParser):
 
     # -------------------------------------------------------------------- parse
 
+    # Set when a scan was handed to Docling + OCR and it did not work. The
+    # caller (build_cards) prints it, because "Docling made 8 cards out of
+    # 854" is otherwise unexplainable. Class-level and bounded: a worker
+    # process cannot send its own list back, so this is a best effort that at
+    # least covers --jobs 1, and the `parser` column covers the rest.
+    ISSUES: List[str] = []
+    last_error: Optional[str] = None
+
+    @classmethod
+    def note_issue(cls, message: str) -> None:
+        cls.last_error = message
+        cls.ISSUES.append(message)
+        if len(cls.ISSUES) > 20:
+            del cls.ISSUES[:-20]
+
     def parse(self, path: Path) -> ParsedDoc:
         self.is_available()
         sha1 = _sha1(path)
         if self.pages == "all":
-            return self._parse_whole(path, sha1)
+            return self._parse_whole(path, sha1, do_ocr=(self.ocr == "on"))
         return self._parse_table_pages(path, sha1)
 
-    def _parse_whole(self, path: Path, sha1: str) -> ParsedDoc:
+    def _ocr_decision(self, base: Optional["ParsedDoc"]) -> bool:
+        """Should Docling run OCR on this file?
+
+        `auto` (the default) answers from the cheap pdfplumber pass that
+        `pages="tables"` already had to make: if it pulled almost no text out
+        of the document, there is no text layer and this is a scan. Nothing
+        is opened twice.
+        """
+        if self.ocr == "on":
+            return True
+        if self.ocr == "off":
+            return False
+        if base is None or not base.pages:
+            return False
+        chars = sum(len(pg.text or "") for pg in base.pages)
+        return chars < 20 * len(base.pages)
+
+    def _parse_whole(self, path: Path, sha1: str, do_ocr: bool = False) -> ParsedDoc:
         try:
-            result = self._convert(path)
+            result = self._convert(path, do_ocr=do_ocr)
         except Exception as exc:                 # noqa: BLE001
             raise ParserUnavailable(
                 "Docling could not convert %s (%s: %s). The usual cause is "
@@ -276,14 +327,32 @@ class DoclingParser(BaseParser):
         """Cheap pass first, Docling only where tables actually are."""
         base = PdfPlumberParser().parse(path)
         candidates = [p.number for p in base.pages if p.tables]
+        do_ocr = self._ocr_decision(base)
         if not candidates:
-            # No tables -> nothing for TableFormer to improve.
+            # The trap this used to fall into: on a scan pdfplumber finds no
+            # tables *because there is no text at all*, so "no tables ->
+            # nothing for TableFormer to improve" returned the empty pdfplumber
+            # result and Docling was never called. That is the whole reason a
+            # Docling run over 854 scans came back with 8 real Docling cards.
+            # No text layer means: convert the whole file, and OCR it.
+            if not do_ocr:
+                return base
+            try:
+                scanned = self._parse_whole(path, sha1, do_ocr=True)
+            except Exception as exc:               # noqa: BLE001 - a scan stays a scan
+                self.note_issue("OCR не сработал для %s (%s: %s)"
+                                % (path.name, type(exc).__name__, str(exc)[:120]))
+                return base
+            if any((pg.text or "").strip() for pg in scanned.pages):
+                return scanned
+            self.note_issue("OCR не дал текста для %s — установлен ли tesseract "
+                            "или easyocr для Docling?" % path.name)
             return base
 
         upgraded = 0
         for start, end in _ranges(candidates):
             try:
-                result = self._convert(path, page_range=(start, end))
+                result = self._convert(path, page_range=(start, end), do_ocr=do_ocr)
             except Exception:                    # noqa: BLE001 - keep the cheap pass
                 continue
             doc = result.document
@@ -437,6 +506,35 @@ def _sha1(path: Path) -> str:
 def _doc_id(path: Path) -> str:
     stem = re.sub(r"[^a-zA-Z0-9]+", "_", path.stem).strip("_").lower()
     return stem or "doc"
+
+
+def doc_id_for(path) -> str:
+    """The doc id without opening the PDF.
+
+    The pipeline names its cache files after this, and it has to know the name
+    before it decides whether the file still needs parsing.
+    """
+    return _doc_id(Path(path))
+
+
+def quiet_docling() -> None:
+    """Shut Docling's loggers up before they shut the pipeline down.
+
+    A 3 519-file run printed hundreds of thousands of
+    `MatchingPostProcessor WARNING Orphan pdf_cell` lines. On Windows the
+    console cannot keep up, the writer blocks, and the run stops making
+    progress while looking perfectly alive. The warnings are noise: an orphan
+    cell only means the layout model found something we do not use.
+
+    Called from every worker, before the first conversion.
+    """
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    for name in ("docling", "docling_core", "docling_parse", "docling_ibm_models",
+                 "PIL", "matplotlib", "urllib3", "fsspec"):
+        try:
+            logging.getLogger(name).setLevel(logging.ERROR)
+        except Exception:                        # noqa: BLE001 - logging is optional
+            pass
 
 
 def _table_to_markdown(table: List[List[str]]) -> str:

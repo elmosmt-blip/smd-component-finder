@@ -446,6 +446,99 @@ def main() -> int:
               [r["part"] for r in fd.read_list(cats)] == ["TPS7A05"],
               str([r["part"] for r in fd.read_list(cats)]))
 
+        print("\n--- v2-схема кэша: jlc_components без колонки basic ---")
+        # Именно это и случилось на настоящем кэше: колонки `basic` нет,
+        # --basic-only молча фильтрует по `preferred`, а их ~1000 на 7.1 млн —
+        # отсюда выгрузка на 974 строки вместо миллиона.
+        dbv = tmp / "jlc-v2.sqlite3"
+        con = sqlite3.connect(str(dbv))
+        con.executescript("""
+            CREATE TABLE manufacturers (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE jlc_components (
+                lcsc INTEGER PRIMARY KEY, mfr TEXT, package TEXT,
+                manufacturer_id INTEGER, description TEXT, datasheet TEXT,
+                stock INTEGER, preferred INTEGER DEFAULT 0,
+                library_type TEXT);
+            INSERT INTO manufacturers VALUES (1,'onsemi'),(2,'Texas Instruments');
+            -- одна серия резисторов: три позиции, один и тот же PDF
+            INSERT INTO jlc_components VALUES
+                (1,'RC0402FR-071KL','0402',1,'res 1k','https://x/series.pdf',900000,0,'base'),
+                (2,'RC0402FR-072KL','0402',1,'res 2k','https://x/series.pdf',500,0,'base'),
+                (3,'RC0402FR-073KL','0402',1,'res 3k','https://x/series.pdf',10,0,'base'),
+                (4,'MMBT3904','SOT-23',1,'NPN','https://x/MMBT3904.pdf',700000,1,'base'),
+                (5,'NODATA','SOT-23',2,'?','',0,0,'expand'),
+                (6,'TPS7A05','SOT-23-5',2,'LDO','https://x/TPS7A05.pdf',42,0,'expand');
+            CREATE VIEW v_components AS SELECT * FROM jlc_components;
+        """)
+        # v_components не должно перекрывать v2-таблицу — но если оно есть,
+        # экспорт берёт его; проверим обе ветки:
+        con.execute("DROP VIEW v_components")
+        con.commit(); con.close()
+
+        v_all = tmp / "v-all.csv"
+        n_all = fd.export_from_sqlite(dbv, v_all, explain=False)
+        check("без --basic-only выгружаются все позиции со ссылкой",
+              n_all == 5, str(n_all))
+
+        v_basic = tmp / "v-basic.csv"
+        n_basic = fd.export_from_sqlite(dbv, v_basic, basic_only=True, explain=False)
+        check("--basic-only без колонки basic даёт только preferred",
+              [r["part"] for r in fd.read_list(v_basic)] == ["MMBT3904"],
+              str([r["part"] for r in fd.read_list(v_basic)]))
+        check("...и их действительно кот наплакал", n_basic == 1, str(n_basic))
+
+        v_dedupe = tmp / "v-dedupe.csv"
+        fd.export_from_sqlite(dbv, v_dedupe, dedupe=True, explain=False)
+        urls = [r["url"] for r in fd.read_list(v_dedupe)]
+        check("--dedupe оставляет одну строку на PDF",
+              len(urls) == len(set(urls)) and len(urls) == 3,
+              str(urls))
+
+        v_pop = tmp / "v-pop.csv"
+        fd.export_from_sqlite(dbv, v_pop, popular_first=True, explain=False)
+        order = [r["part"] for r in fd.read_list(v_pop)]
+        check("--popular-first: первым идёт самый складской",
+              order[0] == "RC0402FR-071KL", str(order))
+
+        v_pop2 = tmp / "v-pop2.csv"
+        fd.export_from_sqlite(dbv, v_pop2, popular_first=True, dedupe=True,
+                              limit=2, explain=False)
+        check("--limit вместе с --popular-first берёт верхние по складу",
+              [r["part"] for r in fd.read_list(v_pop2)] ==
+              ["RC0402FR-071KL", "MMBT3904"],
+              str([r["part"] for r in fd.read_list(v_pop2)]))
+
+        v_lib = tmp / "v-lib.csv"
+        fd.export_from_sqlite(dbv, v_lib, library_type="base", explain=False)
+        check("--library-type фильтрует по типу библиотеки",
+              {r["part"] for r in fd.read_list(v_lib)} ==
+              {"RC0402FR-071KL", "RC0402FR-072KL", "RC0402FR-073KL", "MMBT3904"},
+              str([r["part"] for r in fd.read_list(v_lib)]))
+
+        import io as _io
+        import contextlib as _ctx
+        buf = _io.StringIO()
+        with _ctx.redirect_stdout(buf):
+            fd.export_from_sqlite(dbv, tmp / "v-explain.csv", basic_only=True,
+                                  explain=True)
+        printed = buf.getvalue()
+        check("воронка считает строки по каждому фильтру",
+              "строк всего" in printed and "basic/preferred = 1" in printed,
+              printed[:120])
+        check("про отсутствие колонки basic предупреждают вслух",
+              "колонки `basic` в этой версии кэша нет" in printed, printed[-200:])
+
+        probe = fd.probe_cache(dbv)
+        splits = {label: n for label, n in probe.get("splits", [])}
+        check("--probe показывает, сколько даёт каждый фильтр",
+              splits.get("preferred = 1") == 1
+              and splits.get("library_type = base") == 4
+              and splits.get("library_type = expand") == 2
+              and splits.get("есть ссылка на PDF") == 5, str(splits))
+        check("--probe считает строки в самой таблице",
+              any(t["name"] == "jlc_components" and t["rows"] == 6
+                  for t in probe["tables"]), str(probe["tables"]))
+
         print("\n--- ссылки на сайт производителя ---")
         vendor_csv = tmp / "vendor.csv"
         fd.export_from_sqlite(dbj, vendor_csv, prefer_vendor=True)

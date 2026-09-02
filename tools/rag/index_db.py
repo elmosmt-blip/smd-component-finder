@@ -100,6 +100,16 @@ class RagIndex:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path))
         self.conn.row_factory = sqlite3.Row
+        # WAL so the site can read while the pipeline writes — without it every
+        # index write blocks every search and vice versa. The automatic
+        # checkpoint is tightened from SQLite's 1000 pages: on a 300k corpus a
+        # lazy checkpoint leaves a multi-gigabyte -wal next to the .db, and
+        # that pair is what people end up calling "corrupt" after a crash.
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA wal_autocheckpoint=8192")   # ~32 MB
+        except Exception:                         # noqa: BLE001 - read-only volume
+            pass
         self.conn.executescript(SCHEMA)
         self.conn.commit()
         self.embedding = embedding_backend
@@ -172,6 +182,43 @@ class RagIndex:
         self.conn.commit()
         self.set_meta("embedding_backend", self.embedding.describe())
         return len(rows)
+
+    # ----------------------------------------------------------- maintenance
+
+    def doc_ids(self) -> set:
+        """Every doc_id already indexed — the pipeline skips those on resume."""
+        return {r[0] for r in self.conn.execute("SELECT doc_id FROM docs")}
+
+    def integrity(self) -> Tuple[bool, str]:
+        """Is the FTS index usable?
+
+        An index killed mid-run (Ctrl-C, OOM, a worker that died) can leave the
+        FTS5 structure disagreeing with the `chunks` table. SQLite will not
+        tell you unless you ask, and asking is one statement.
+        """
+        try:
+            self.conn.execute(
+                "INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')")
+            self.conn.commit()
+            return True, "ok"
+        except Exception as exc:                  # noqa: BLE001 - this IS the report
+            return False, "%s: %s" % (type(exc).__name__, exc)
+
+    def repair(self) -> int:
+        """Rebuild the FTS index from the `chunks` table.
+
+        Cheap next to re-parsing a corpus, and it turns "the index is broken,
+        delete it and spend another night" into a two-minute fix.
+        """
+        # 'delete-all' only exists on contentless tables; ours stores the text,
+        # so a plain DELETE is the way in.
+        self.conn.execute("DELETE FROM chunks_fts")
+        self.conn.execute(
+            "INSERT INTO chunks_fts(chunk_id, part, section, text, summary) "
+            "SELECT chunk_id, COALESCE(part,''), COALESCE(section,''), "
+            "COALESCE(text,''), COALESCE(summary,'') FROM chunks")
+        self.conn.commit()
+        return self.conn.execute("SELECT COUNT(*) n FROM chunks").fetchone()["n"]
 
     def set_meta(self, key: str, value: str) -> None:
         self.conn.execute(
@@ -330,4 +377,11 @@ class RagIndex:
         return results
 
     def close(self) -> None:
+        try:
+            # Fold the -wal into the .db file. A 300k index that is still
+            # split across index.db + index.db-wal is one deleted -wal away
+            # from looking corrupt, and the -wal can be gigabytes.
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:                         # noqa: BLE001 - closing anyway
+            pass
         self.conn.close()

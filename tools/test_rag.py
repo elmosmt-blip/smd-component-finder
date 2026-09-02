@@ -181,6 +181,72 @@ def run(tmp: Path, corpus: Path, out: Path) -> int:
     idx_par.close(); idx_seq.close()
     (corpus / "broken.pdf").unlink()
 
+    print("\n--- продолжение после остановки: кэш parsed/ и resume ---")
+    # A 3 519-file run died once and took the index with it. Two things make
+    # that survivable: a document already in the index is not parsed again,
+    # and parsed/<doc>.chunks.json means even a wiped index costs no Docling.
+    resume_out = tmp / "index-resume"
+    s1 = pipeline.build(corpus, resume_out, "pdfplumber", "none",
+                        rebuild=True, jobs=2, verbose=False)
+    check("первый прогон: 6 документов в индексе",
+          s1.get("docs") == 6, str(s1.get("docs")))
+
+    s2 = pipeline.build(corpus, resume_out, "pdfplumber", "none",
+                        jobs=2, verbose=False)
+    check("второй прогон ничего не переделывает",
+          s2.get("already_indexed") == 6 and s2.get("indexed") == 0,
+          "%s / %s" % (s2.get("already_indexed"), s2.get("indexed")))
+    check("индекс не распух от повторной записи",
+          s2.get("chunks") == s1.get("chunks"),
+          "%s != %s" % (s2.get("chunks"), s1.get("chunks")))
+
+    s3 = pipeline.build(corpus, resume_out, "pdfplumber", "none",
+                        rebuild=True, jobs=2, verbose=False)
+    check("с --rebuild чанки берутся из кэша, а не из PDF",
+          s3.get("from_cache") == 6, str(s3.get("from_cache")))
+    check("кэш даёт тот же индекс", s3.get("chunks") == s1.get("chunks"),
+          "%s != %s" % (s3.get("chunks"), s1.get("chunks")))
+
+    s4 = pipeline.build(corpus, resume_out, "pdfplumber", "none",
+                        rebuild=True, jobs=2, verbose=False,
+                        reuse=False, resume=False)
+    check("--no-reuse-parsed заставляет разбирать заново",
+          s4.get("from_cache") == 0 and s4.get("indexed") == 6,
+          "%s / %s" % (s4.get("from_cache"), s4.get("indexed")))
+
+    check("кэш лежит рядом с markdown",
+          len(list((resume_out / "parsed").glob("*.chunks.json"))) == 6,
+          str(len(list((resume_out / "parsed").glob("*.chunks.json")))))
+    cached = pipeline.load_cache(resume_out, sorted(corpus.glob("*.pdf"))[0])
+    check("load_cache отдаёт и документ, и чанки",
+          bool(cached) and cached.get("chunks") and cached["doc"]["doc_id"],
+          str(cached)[:80])
+    import os as _os
+    target = sorted(corpus.glob("*.pdf"))[0]
+    _os.utime(target, (0, 0))                      # другой mtime — кэш недействителен
+    check("подменённый/перезаписанный файл не берётся из кэша",
+          pipeline.load_cache(resume_out, target) is None)
+
+    print("\n--- целостность FTS и восстановление ---")
+    idx_chk = index_db.RagIndex(resume_out / "index.db")
+    ok_fts, msg = idx_chk.integrity()
+    check("свежий индекс проходит проверку целостности", ok_fts is True, str(msg))
+    check("pipeline.check_index сообщает то же самое",
+          pipeline.check_index(idx_chk) == "ok", pipeline.check_index(idx_chk))
+    before = [h["chunk_id"] for h in idx_chk.search("collector current", k=5)]
+    n = idx_chk.repair()
+    after = [h["chunk_id"] for h in idx_chk.search("collector current", k=5)]
+    check("пересборка FTS не теряет чанки", n == idx_chk.stats()["chunks"],
+          "%s != %s" % (n, idx_chk.stats()["chunks"]))
+    check("после пересборки поиск даёт те же результаты", before == after,
+          "%s != %s" % (before[:2], after[:2]))
+    check("doc_ids отдаёт проиндексированные документы",
+          len(idx_chk.doc_ids()) == 6, str(len(idx_chk.doc_ids())))
+    idx_chk.close()
+    check("бэкенд без поддержки проверки не ломает отчёт",
+          pipeline.check_index(object()).startswith("не проверяется"),
+          pipeline.check_index(object()))
+
     print("\n--- SigV4 против botocore ---")
     sigv4_smoke()
 
