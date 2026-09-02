@@ -52,6 +52,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from tools.rag import cli  # noqa: E402
+
 PDF_MAGIC = b"%PDF"
 MIN_PDF_BYTES = 4096                 # smaller than this is an error page, not a datasheet
 
@@ -113,6 +117,7 @@ class Fetcher:
         self._last_request: Dict[str, float] = {}
         self._robots: Dict[str, Optional[urllib.robotparser.RobotFileParser]] = {}
         self.seen_sha1: Dict[str, str] = {}      # sha1 -> filename already on disk
+        self.seen_url: Dict[str, str] = {}       # url   -> file it produced once
         # One lock for the bookkeeping, one per host for the rate limit. The
         # host lock is held only while a start slot is reserved — never across
         # the socket — so N workers can have N requests in flight while the
@@ -140,6 +145,8 @@ class Fetcher:
             rows.append(row)
             if row.get("sha1") and row.get("file"):
                 self.seen_sha1[row["sha1"]] = row["file"]
+            if row.get("url") and row.get("file"):
+                self.seen_url[row["url"]] = row["file"]
         return rows
 
     def _record(self, row: dict) -> None:
@@ -277,6 +284,17 @@ class Fetcher:
 
         if not url:
             return fail("no url")
+        with self._lock:
+            already = self.seen_url.get(url)
+        if already:
+            # Same URL, already on disk from an earlier run. Growing a corpus
+            # is mostly rerunning it, and there is no reason to pay for the
+            # bytes twice just to discover the hash matches.
+            result["file"] = ""
+            result["error"] = "already fetched as %s" % already
+            with self._lock:
+                self.stats["duplicate"] += 1
+            return result
         if not self.allowed(url):
             return fail("robots.txt disallows this path (use a distributor API)",
                         "blocked")
@@ -301,6 +319,7 @@ class Fetcher:
             self.out_dir.mkdir(parents=True, exist_ok=True)
             path.write_bytes(body)
             self.seen_sha1[sha1] = path.name
+            self.seen_url[url] = path.name
             self.stats["ok"] += 1
         result["file"] = path.name
         result["bytes"] = len(body)
@@ -354,6 +373,144 @@ class Fetcher:
 
 
 # --------------------------------------------------------------------- input
+
+def probe_cache(db_path: Path, columns: int = 40) -> dict:
+    """What is actually inside this cache file?
+
+    The catalogue has changed its layout more than once (`components` ->
+    `jlc_components`), and the error message you get when the shape moved is
+    useless if you cannot see the shape. So: tables, row counts and columns,
+    printed as text you can paste into a chat.
+    """
+    import sqlite3
+
+    out: dict = {"tables": [], "error": ""}
+    if not db_path.exists():
+        # sqlite3.connect() happily creates an empty file, and "this cache is
+        # empty" is a lie worth avoiding.
+        out["error"] = "нет файла: %s" % db_path
+        return out
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    try:
+        objects = con.execute(
+            "SELECT name, type FROM sqlite_master "
+            "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for obj in objects:
+            name, kind = obj["name"], obj["type"]
+            try:
+                rows = con.execute("SELECT COUNT(*) FROM %s" % name).fetchone()[0]
+            except sqlite3.Error:
+                rows = -1
+            try:
+                cols = [r[1] for r in con.execute("PRAGMA table_info(%s)" % name)]
+            except sqlite3.Error:
+                cols = []
+            out["tables"].append({"name": name, "kind": kind, "rows": rows,
+                                  "columns": cols[:columns]})
+    except sqlite3.Error as exc:
+        out["error"] = str(exc)
+    finally:
+        con.close()
+    return out
+
+
+def print_probe(db_path: Path, probe: dict) -> None:
+    print("Кэш каталога: %s" % db_path)
+    if probe["error"]:
+        print("  [!!] не читается: %s" % probe["error"])
+        return
+    for table in probe["tables"]:
+        rows = "%d строк" % table["rows"] if table["rows"] >= 0 else "не посчитать"
+        print("  %-22s %-6s %s" % (table["name"], table["kind"], rows))
+        if table["columns"]:
+            print("      колонки: %s" % ", ".join(table["columns"]))
+    print("")
+    print("Дальше:")
+    print("  python3 tools/rag/fetch_datasheets.py --from-jlcparts %s --to-csv parts.csv"
+          % db_path)
+
+
+def manifest_report(path: Path, top: int = 10) -> dict:
+    """What did we actually download? Read it back out of the manifest.
+
+    The interesting number is never "files downloaded": it is how many were
+    duplicates, how many failed, how big they are on average and where they
+    came from. On the first real corpus the duplicate rate was 58 %, which
+    changes what "300 000 PDFs" even means.
+    """
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+
+    counts = {"ok": 0, "duplicate": 0, "failed": 0, "blocked": 0}
+    hosts: Dict[str, int] = {}
+    errors: Dict[str, int] = {}
+    sizes: List[int] = []
+    for row in rows:
+        if row.get("file"):
+            counts["ok"] += 1
+            sizes.append(int(row.get("bytes") or 0))
+        error = (row.get("error") or "").strip()
+        if error.startswith("duplicate") or error.startswith("already fetched"):
+            counts["duplicate"] += 1
+        elif error.startswith("robots"):
+            counts["blocked"] += 1
+        elif error:
+            counts["failed"] += 1
+            errors[error.split(":")[0][:60]] = errors.get(
+                error.split(":")[0][:60], 0) + 1
+        if row.get("url"):
+            host = urllib.parse.urlsplit(row["url"]).netloc
+            hosts[host] = hosts.get(host, 0) + 1
+
+    unique = counts["ok"]
+    total_attempts = len(rows)
+    return {
+        "path": str(path),
+        "attempts": total_attempts,
+        "counts": counts,
+        "bytes": sum(sizes),
+        "avg_bytes": int(sum(sizes) / unique) if unique else 0,
+        "dup_rate": round(100.0 * counts["duplicate"] / total_attempts, 1) if total_attempts else 0.0,
+        "hosts": sorted(hosts.items(), key=lambda kv: -kv[1])[:top],
+        "errors": sorted(errors.items(), key=lambda kv: -kv[1])[:5],
+        "top": top,
+    }
+
+
+def print_manifest_report(report: dict) -> None:
+    c = report["counts"]
+    print("Манифест: %s" % report["path"])
+    print("  попыток (строк):        %d" % report["attempts"])
+    print("  скачано файлов:         %d" % c["ok"])
+    print("  дублей (не сохраняли):  %d  (%.1f%% попыток)"
+          % (c["duplicate"], report["dup_rate"]))
+    print("  сбоев:                  %d" % c["failed"])
+    print("  запрещено robots.txt:   %d" % c["blocked"])
+    if c["ok"]:
+        print("  место на диске:         %.2f ГБ, средний файл %.0f КБ"
+              % (report["bytes"] / 2 ** 30, report["avg_bytes"] / 1024.0))
+        print("  прогноз на 300 000 PDF: %.0f ГБ (по среднему размеру)"
+              % (300000 * report["avg_bytes"] / 2 ** 30))
+    if report["hosts"]:
+        print("")
+        print("  откуда качали:")
+        for host, n in report["hosts"]:
+            print("    %-38s %d" % (host, n))
+    if report["errors"]:
+        print("")
+        print("  почему не скачалось:")
+        for error, n in report["errors"]:
+            print("    %-38s %d" % (error, n))
+
 
 def _fmt_hours(seconds: float) -> str:
     """'3.5 days' rather than '302400.0s' — the number people actually need
@@ -430,7 +587,11 @@ def _source_table(con, tables: List[str], views: List[str], wanted: str) -> str:
     """
     if wanted in tables or wanted in views:
         return wanted
-    for name in ("v_components", "components", "parts", "v_parts"):
+    # jlcparts moved to a "v2" layout in 2026: `jlc_components` and
+    # `lcsc_components` replaced `components` / `v_components`. Both shapes
+    # are listed, so a cache downloaded a year ago still works.
+    for name in ("v_components", "components", "jlc_components",
+                 "lcsc_components", "parts", "v_parts"):
         if name in views or name in tables:
             return name
     return ""
@@ -566,6 +727,10 @@ def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "",
 
 
 def main() -> int:
+    # Before anything is printed. This catalogue is full of Chinese part
+    # names, and a Windows console defaults to cp1251: without this the very
+    # first exotic marking kills a long run with UnicodeEncodeError.
+    cli.fix_windows_console()
     ap = argparse.ArgumentParser(description="Download datasheet PDFs into the corpus")
     ap.add_argument("--list", type=Path, help="CSV/JSON part list: part,manufacturer,package,url")
     ap.add_argument("--parts", type=Path, help="plain text file, one part number per line")
@@ -590,8 +755,26 @@ def main() -> int:
     ap.add_argument("--user-agent", default="")
     ap.add_argument("--ignore-robots", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="print URLs, download nothing")
+    ap.add_argument("--probe", type=Path, metavar="CACHE.SQLITE3",
+                    help="show what is inside a catalogue cache and exit")
+    ap.add_argument("--report", type=Path, metavar="MANIFEST.JSONL",
+                    help="summarise a download manifest and exit")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+
+    if args.probe:
+        if not args.probe.exists():
+            print("No such file: %s" % args.probe)
+            return 2
+        print_probe(args.probe, probe_cache(args.probe))
+        return 0
+
+    if args.report:
+        if not args.report.exists():
+            print("No such file: %s" % args.report)
+            return 2
+        print_manifest_report(manifest_report(args.report))
+        return 0
 
     if args.from_jlcparts:
         target = args.to_csv or Path("parts.csv")

@@ -96,10 +96,10 @@
   .venv\Scripts\python tools\test_ingest.py    # 23
   .venv\Scripts\python tools\test_opensearch.py# 43 (без кластера, на заглушке)
   .venv\Scripts\python tools\test_docling.py   # 32 (без весов моделей)
-  .venv\Scripts\python tools\test_fetch.py     # 60
+  .venv\Scripts\python tools\test_fetch.py     # 77
   .venv\Scripts\python tools\test_quality.py   # 49
   .venv\Scripts\python tools\test_tables.py    # 44
-Всего 390 проверок. Если что-то падает — разберись до следующего шага и напиши
+Всего 407 проверок. Если что-то падает — разберись до следующего шага и напиши
 в отчёте, что именно упало.
 
 ШАГ 4. OpenSearch (только если есть docker)
@@ -264,6 +264,10 @@ Expand-Archive такие архивы не понимает.
   --category X   фильтр по категории, например --category Transistors
                  (ищет и по категории, и по подкатегории)
   --limit N      только первые N строк (для пробы)
+Если что-то не так со схемой, сначала посмотри, что внутри:
+  .venv\Scripts\python tools\rag\fetch_datasheets.py --probe C:\smd-corpus\cache.sqlite3
+Он печатает таблицы, число строк и колонки каждой. Пришли вывод, если экспорт
+не пошёл.
 Экспортёр сам читает схему файла (PRAGMA table_info) и ищет колонки по именам,
 поэтому переживёт смену формата. В настоящей базе таблица называется
 `components`, есть view `v_components` (в нём производитель и категория уже
@@ -294,6 +298,13 @@ Expand-Archive такие архивы не понимает.
 размер), повторяет при 5xx, не хранит дубли по SHA1, уважает robots.txt и пишет
 manifest.jsonl с происхождением каждого файла. Прерванную загрузку можно
 продолжить той же командой — уже скачанное пропустится.
+
+Отчёт по уже скачанному (сколько попыток, сколько дублей, сколько места,
+средний размер, прогноз на 300 000, откуда качали):
+  .venv\Scripts\python tools\rag\fetch_datasheets.py --report C:\smd-corpus\pdf\manifest.jsonl
+Доля дублей здесь — важнейшая цифра. Если она 50 % и выше, значит каталог
+отдаёт один и тот же даташит на десятки парт-номеров (серии вроде 1KSMB10A…
+1KSMB200A), и «300 000 скачанных файлов» — это не 300 000 документов.
 
 ПОСЛЕ ПРОБНОЙ ТЫСЯЧИ — ОБЯЗАТЕЛЬНО ОСТАНОВИСЬ И ПОСЧИТАЙ МЕСТО:
   $n = (Get-ChildItem C:\smd-corpus\pdf -Filter *.pdf).Count
@@ -330,9 +341,10 @@ manifest.jsonl с происхождением каждого файла. Пре
 Вывод tools\rag\doctor.py — целиком, без сокращений
 Вывод tools\rag\audit_cards.py (с --scan-check) — целиком
 Вывод tools\rag\audit_tables.py --limit 50 — целиком
+Вывод tools\rag\fetch_datasheets.py --report <manifest.jsonl> — целиком
 ОС: Windows 11 (сборка ...), docker есть / нет
 Машина: CPU ..., ядер N, RAM ... ГБ, свободно на диске ... ГБ
-Тесты: 390/390 (если меньше — что упало и почему)
+Тесты: 407/407 (если меньше — что упало и почему)
 OpenSearch: поднят / не поднят (причина)
 Сайт: http://localhost:8000 — работает / нет
 Существующая папка: N PDF, M карточек, P ошибок, время T

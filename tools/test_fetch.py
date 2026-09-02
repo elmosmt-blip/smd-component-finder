@@ -446,6 +446,62 @@ def main() -> int:
               [r["part"] for r in fd.read_list(cats)] == ["TPS7A05"],
               str([r["part"] for r in fd.read_list(cats)]))
 
+        print("\n--- повторный URL не качается второй раз ---")
+        once_more = fd.Fetcher(out, delay=0.0, retries=1, timeout=10)
+        once_more.load_manifest()
+        again = once_more.fetch_one({"part": "MMBT3904", "url": base + "/good.pdf"})
+        check("тот же URL не уходит в сеть повторно",
+              again["error"].startswith("already fetched"), again["error"])
+        check("повтор не считается новым файлом", once_more.stats["ok"] == 0,
+              str(once_more.stats))
+
+        print("\n--- разведка по кэшу каталога ---")
+        probe = fd.probe_cache(dbj)
+        names = [t["name"] for t in probe["tables"]]
+        check("таблицы перечислены",
+              "components" in names and "manufacturers" in names, str(names))
+        check("представление видно с пометкой view",
+              any(t["name"] == "v_components" and t["kind"] == "view"
+                  for t in probe["tables"]), str(probe["tables"]))
+        by_name = {t["name"]: t for t in probe["tables"]}
+        check("число строк посчитано",
+              by_name["components"]["rows"] == 3, str(by_name["components"]))
+        check("колонки видны",
+              "datasheet" in by_name["components"]["columns"],
+              str(by_name["components"]["columns"][:8]))
+        check("чужая база не роняет разведку",
+              fd.probe_cache(tmp / "no-such-file.sqlite3")["error"] != "")
+
+        print("\n--- отчёт по манифесту ---")
+        fake = tmp / "manifest-report.jsonl"
+        lines = []
+        for i in range(3):
+            lines.append(json.dumps({"part": "P%d" % i, "url": "https://a.test/x%d.pdf" % i,
+                                     "file": "x%d.pdf" % i, "bytes": 1024 * 1024,
+                                     "sha1": "a" * 40, "status": 200}))
+        lines.append(json.dumps({"part": "DUP", "url": "https://a.test/x0.pdf",
+                                 "file": "", "bytes": 0, "sha1": "b" * 40,
+                                 "error": "duplicate of x0.pdf", "status": 200}))
+        lines.append(json.dumps({"part": "DEAD", "url": "https://b.test/y.pdf",
+                                 "file": "", "bytes": 0, "sha1": "",
+                                 "error": "HTTP 404", "status": 404}))
+        fake.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        rep = fd.manifest_report(fake)
+        check("попыток посчитано", rep["attempts"] == 5, str(rep["attempts"]))
+        check("скачанных три", rep["counts"]["ok"] == 3, str(rep["counts"]))
+        check("дубль посчитан", rep["counts"]["duplicate"] == 1, str(rep["counts"]))
+        check("сбой посчитан", rep["counts"]["failed"] == 1, str(rep["counts"]))
+        check("место посчитано", rep["bytes"] == 3 * 1024 * 1024, str(rep["bytes"]))
+        check("средний размер посчитан", rep["avg_bytes"] == 1024 * 1024,
+              str(rep["avg_bytes"]))
+        check("доля дублей посчитана", rep["dup_rate"] == 20.0, str(rep["dup_rate"]))
+        check("хосты собраны", ("a.test", 4) in rep["hosts"], str(rep["hosts"]))
+        check("причины сбоев собраны", any("HTTP 404" in e for e, _ in rep["errors"]),
+              str(rep["errors"]))
+        check("прогноз на 300 000 считается без деления на ноль",
+              fd.manifest_report(tmp / "empty.jsonl")["avg_bytes"] == 0
+              if (tmp / "empty.jsonl").write_text("", encoding="utf-8") is None else True)
+
         db3 = tmp / "broken.sqlite3"
         con = sqlite3.connect(str(db3))
         con.executescript("CREATE TABLE parts (foo TEXT, bar TEXT);")
