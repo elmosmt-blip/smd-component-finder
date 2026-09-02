@@ -300,6 +300,16 @@ class Fetcher:
                         "blocked")
 
         status, body = self.get(url)
+        backup = str(row.get("source_url") or "").strip()
+        if (status != 200 or not body) and backup and backup != url:
+            # Vendor URL patterns are guesswork and vendors move files. The
+            # catalogue link is the one we know exists, so use it instead of
+            # losing the part — and say in the manifest which one worked.
+            fstatus, fbody = self.get(backup)
+            if fstatus == 200 and fbody:
+                url, status, body = backup, fstatus, fbody
+                result["url"] = backup
+                result["fallback"] = True
         result["status"] = status
         if status != 200 or not body:
             return fail("HTTP %d" % status if status else "network error")
@@ -610,8 +620,16 @@ def _fmt_lcsc(value: Any) -> str:
 def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "",
                        basic_only: bool = False, min_stock: int = 0,
                        category: str = "", limit: int = 0,
-                       verbose: bool = False) -> int:
+                       prefer_vendor: bool = False, verbose: bool = False) -> int:
     """Turn a parts database (jlcparts and friends) into a part list CSV.
+
+    `prefer_vendor` is the interesting one. The catalogue links mostly point
+    at LCSC's own copies — often a scan of the original. When the row names a
+    manufacturer we know the URL pattern for (TI, ST, NXP, onsemi, Diodes,
+    Microchip, Vishay, ROHM), the link is rebuilt to point at the
+    manufacturer's own PDF. Same part, much better document. The catalogue
+    link is kept in a `source_url` column and used as a fallback if the
+    vendor URL 404s.
 
     Nothing here assumes a schema: columns are found by name, and if the file
     does not look like a parts catalogue the available columns are printed so
@@ -712,16 +730,36 @@ def export_from_sqlite(db_path: Path, out_csv: Path, table: str = "",
     header = ["part", "manufacturer", "package", "url"]
     if lcsc_col and lcsc_col != part_col:
         header.append("lcsc")
+    if prefer_vendor:
+        header.append("source_url")
+
+    vendor_hits = 0
     with out_csv.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(header)
         for row in rows:
-            writer.writerow([row["part"] or "", row["manufacturer"] or "",
-                             row["package"] or "", row["url"] or ""]
-                            + ([_fmt_lcsc(row["lcsc"])]
-                               if header[-1] == "lcsc" else []))
+            part = row["part"] or ""
+            manufacturer = row["manufacturer"] or ""
+            catalog_url = row["url"] or ""
+            url = catalog_url
+            if prefer_vendor:
+                vendor = vendor_of({"manufacturer": manufacturer})
+                if vendor:
+                    built = build_url(vendor, part)
+                    if built:
+                        url = built
+                        vendor_hits += 1
+            fields = [part, manufacturer, row["package"] or "", url]
+            if header[-1] == "lcsc" or (lcsc_col and lcsc_col != part_col):
+                fields.append(_fmt_lcsc(row["lcsc"]))
+            if prefer_vendor:
+                fields.append(catalog_url)
+            writer.writerow(fields)
     if verbose:
         print("Exported %d parts from %s -> %s" % (len(rows), source, out_csv))
+        if prefer_vendor:
+            print("  vendor datasheet URLs: %d of %d (the rest keep the "
+                  "catalogue link as a fallback)" % (vendor_hits, len(rows)))
     return len(rows)
 
 
@@ -744,6 +782,9 @@ def main() -> int:
                     help="JLCPCB basic/preferred parts only")
     ap.add_argument("--min-stock", type=int, default=0)
     ap.add_argument("--category", default="", help="substring of the category name")
+    ap.add_argument("--prefer-vendor", action="store_true",
+                    help="link to the manufacturer's own PDF instead of the "
+                         "catalogue copy, when we know its URL pattern")
     ap.add_argument("--out", type=Path, default=Path("data/datasheets"))
     ap.add_argument("--delay", type=float, default=1.0, help="seconds between requests, per host")
     ap.add_argument("--retries", type=int, default=3)
@@ -785,7 +826,8 @@ def main() -> int:
         n = export_from_sqlite(args.from_jlcparts, target,
                                basic_only=args.basic_only,
                                min_stock=args.min_stock, category=args.category,
-                               limit=args.limit, verbose=True)
+                               limit=args.limit, prefer_vendor=args.prefer_vendor,
+                               verbose=True)
         print("Next: python3 tools/rag/fetch_datasheets.py --list %s "
               "--out %s --dry-run" % (target, args.out))
         return 0 if n else 1

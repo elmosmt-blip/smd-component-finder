@@ -446,6 +446,47 @@ def main() -> int:
               [r["part"] for r in fd.read_list(cats)] == ["TPS7A05"],
               str([r["part"] for r in fd.read_list(cats)]))
 
+        print("\n--- ссылки на сайт производителя ---")
+        vendor_csv = tmp / "vendor.csv"
+        fd.export_from_sqlite(dbj, vendor_csv, prefer_vendor=True)
+        rows_v = fd.read_list(vendor_csv)
+        urls_v = {r["part"]: r["url"] for r in rows_v}
+        check("MMBT3904 ведёт на onsemi.com",
+              "onsemi.com" in urls_v.get("MMBT3904", ""), str(urls_v))
+        check("TPS7A05 ведёт на ti.com",
+              "ti.com" in urls_v.get("TPS7A05", ""), str(urls_v))
+        check("ссылка каталога сохранена в source_url",
+              rows_v[0]["source_url"].startswith("https://x/"),
+              str(rows_v[0].get("source_url")))
+        check("без флага ссылки остаются каталожными",
+              all("x/" in r["url"] for r in rows_real), str([r["url"] for r in rows_real]))
+
+        mystery = tmp / "mystery.sqlite3"
+        con = sqlite3.connect(str(mystery))
+        con.executescript("""
+            CREATE TABLE parts (mfr TEXT, manufacturer TEXT, package TEXT, datasheet TEXT);
+            INSERT INTO parts VALUES ('X1','Mystery Corp','SOT-23','https://x/x1.pdf');
+        """)
+        con.commit(); con.close()
+        mys_csv = tmp / "mystery.csv"
+        fd.export_from_sqlite(mystery, mys_csv, prefer_vendor=True)
+        row_m = fd.read_list(mys_csv)[0]
+        check("незнакомый производитель — остаётся ссылка каталога",
+              row_m["url"] == "https://x/x1.pdf", str(row_m))
+
+        print("\n--- резервная ссылка, если URL производителя не сработал ---")
+        fb_out = tmp / "fallback"
+        fb_out.mkdir()
+        fback = fd.Fetcher(fb_out, delay=0.0, retries=0, timeout=10)
+        res = fback.fetch_one({"part": "FALLBACK", "url": base + "/nope.pdf",
+                               "source_url": base + "/good3.pdf"})
+        check("при 404 берётся ссылка из source_url",
+              bool(res.get("file")) and res["url"].endswith("good3.pdf"), str(res))
+        check("в манифесте отмечено, что сработал резерв",
+              res.get("fallback") is True, str(res))
+        check("файл реально сохранён",
+              (fb_out / res["file"]).exists() if res.get("file") else False, str(res))
+
         print("\n--- повторный URL не качается второй раз ---")
         once_more = fd.Fetcher(out, delay=0.0, retries=1, timeout=10)
         once_more.load_manifest()
