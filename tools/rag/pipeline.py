@@ -21,8 +21,9 @@ import argparse
 import json
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -39,9 +40,67 @@ DEFAULT_CORPUS = DATA_DIR / "datasheets"
 DEFAULT_OUT = DATA_DIR / "rag"
 
 
+# --------------------------------------------------------------------------- #
+# workers (module level: they have to be picklable)
+#
+# Parsing and chunking is CPU-bound and independent per file, so it scales with
+# cores. Writing to the index does not: SQLite takes one writer, so every
+# `index.add_document` stays in the parent process and only the heavy part runs
+# in the pool. Sequential measured 0.5 PDF/s, which put the remaining 20k files
+# of a real corpus at half a day.
+# --------------------------------------------------------------------------- #
+
+_WORKER: Dict[str, Any] = {}
+
+
+def _worker_init(parser_name: str, out_dir: str, docling_pages: str = "") -> None:
+    opts = {"pages": docling_pages} if docling_pages else {}
+    _WORKER["parser"] = parsers.get_parser(parser_name, **opts)
+    _WORKER["splitter"] = chunking.ElementSplitter()
+    _WORKER["out"] = Path(out_dir)
+
+
+def _worker_one(pdf_str: str) -> Dict[str, Any]:
+    """Parse, enrich, chunk and cache the markdown. Never raises."""
+    pdf = Path(pdf_str)
+    out: Path = _WORKER["out"]
+    try:
+        parsed = _WORKER["parser"].parse(pdf)
+        meta = metadata.enrich(parsed)
+        chunks = chunking.chunk_document(parsed, meta, splitter=_WORKER["splitter"])
+
+        # keep the markdown so the pipeline can be debugged without re-parsing
+        (out / "parsed" / (parsed.doc_id + ".md")).write_text(
+            parsed.markdown, encoding="utf-8")
+        (out / "parsed" / (parsed.doc_id + ".meta.json")).write_text(
+            json.dumps(meta.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+        return {
+            "ok": True,
+            "doc": {
+                "doc_id": parsed.doc_id,
+                "filename": parsed.filename,
+                "sha1": parsed.sha1,
+                "n_pages": parsed.n_pages,
+                "parser": parsed.parser,
+                "part": meta.part,
+                "manufacturer": meta.manufacturer,
+                "package": meta.package,
+                "family": meta.family,
+                "conf": meta.confidence,
+            },
+            "chunks": [c.to_dict() for c in chunks],
+            "n_chunks": len(chunks),
+        }
+    except Exception as exc:                       # noqa: BLE001 - one bad PDF is data
+        return {"ok": False, "filename": pdf.name,
+                "error": "%s: %s" % (type(exc).__name__, exc)}
+
+
 def build(corpus: Path, out: Path, parser_name: str = "auto", embed: str = "none",
           rebuild: bool = False, limit: int = 0, verbose: bool = False,
-          backend: str = "auto", docling_pages: Optional[str] = None) -> dict:
+          backend: str = "auto", docling_pages: Optional[str] = None,
+          jobs: int = 0) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     db_path = out / "index.db"
     (out / "parsed").mkdir(exist_ok=True)
@@ -69,79 +128,110 @@ def build(corpus: Path, out: Path, parser_name: str = "auto", embed: str = "none
     if limit:
         pdfs = pdfs[:limit]
 
-    splitter = chunking.ElementSplitter()
-    print("Chunker:     %s" % splitter.backend)
-    print("Documents:   %d\n" % len(pdfs))
+    # Built once here and once per worker: it is cheap, and the workers need
+    # their own copy (a LlamaIndex parser is not picklable across processes).
+    chunker_name = chunking.ElementSplitter().backend
+    print("Chunker:     %s" % chunker_name)
+    jobs = max(1, int(jobs or os.cpu_count() or 1)) if len(pdfs) > 1 else 1
+    print("Documents:   %d   workers: %d\n" % (len(pdfs), jobs))
 
     t0 = time.time()
     fallback_used = False
     ok = skipped = 0
     total_chunks = 0
 
-    for i, pdf in enumerate(pdfs, start=1):
-        try:
-            parsed = parser.parse(pdf)
-        except parsers.ParserUnavailable as exc:
-            if parser.name == "docling":
-                print("  ! Docling unavailable (%s) — falling back to pdfplumber" % exc)
-                parser = parsers.get_parser("pdfplumber")
-                fallback_used = True
-                try:
-                    parsed = parser.parse(pdf)
-                except Exception as exc2:
-                    print("  x %s: %s" % (pdf.name, exc2))
-                    skipped += 1
-                    continue
-            else:
-                print("  x %s: %s" % (pdf.name, exc))
-                skipped += 1
-                continue
-        except Exception as exc:
-            print("  x %s: %s" % (pdf.name, exc))
+    def store(result: Dict[str, Any], i: int) -> None:
+        """Write one finished document into the index. Parent process only."""
+        nonlocal ok, skipped, total_chunks
+        if not result["ok"]:
+            print("  x %s: %s" % (result["filename"], result["error"]))
             skipped += 1
-            continue
-
-        meta = metadata.enrich(parsed)
-        chunks = chunking.chunk_document(parsed, meta, splitter=splitter)
-
-        # keep the markdown so the pipeline can be debugged without re-parsing
-        md_path = out / "parsed" / (parsed.doc_id + ".md")
-        md_path.write_text(parsed.markdown, encoding="utf-8")
-        (out / "parsed" / (parsed.doc_id + ".meta.json")).write_text(
-            json.dumps(meta.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-
-        index.add_document(
-            {
-                "doc_id": parsed.doc_id,
-                "filename": parsed.filename,
-                "sha1": parsed.sha1,
-                "n_pages": parsed.n_pages,
-                "parser": parsed.parser,
-                "part": meta.part,
-                "manufacturer": meta.manufacturer,
-                "package": meta.package,
-                "family": meta.family,
-                "conf": meta.confidence,
-            },
-            [c.to_dict() for c in chunks],
-        )
-
-        total_chunks += len(chunks)
+            return
+        doc = result["doc"]
+        index.add_document(doc, result["chunks"])
+        total_chunks += result["n_chunks"]
         ok += 1
         print(
             "  [%2d/%2d] %-34s part=%-14s mfr=%-22s pkg=%-10s pages=%-3d chunks=%-3d conf=%.2f"
-            % (i, len(pdfs), parsed.filename[:34], meta.part or "-",
-               (meta.manufacturer or "-")[:22], meta.package or "-",
-               parsed.n_pages, len(chunks), meta.confidence)
+            % (i, len(pdfs), doc["filename"][:34], doc["part"] or "-",
+               (doc["manufacturer"] or "-")[:22], doc["package"] or "-",
+               doc["n_pages"], result["n_chunks"], doc["conf"])
         )
+
+    if jobs > 1:
+        # Docling downloads its models on the first parse. If that fails, it
+        # fails in every worker, so find out here — once — instead of twenty
+        # times, and fall back the way the sequential path always did.
+        try:
+            parser.parse(pdfs[0])
+        except Exception as exc:                   # noqa: BLE001 - any parse error
+            if parser.name == "docling":
+                print("  ! Docling failed (%s) — falling back to pdfplumber"
+                      % type(exc).__name__)
+                parser = parsers.get_parser("pdfplumber")
+                fallback_used = True
+            else:
+                raise
+        with ProcessPoolExecutor(
+                max_workers=min(jobs, len(pdfs)),
+                initializer=_worker_init,
+                initargs=(parser.name, str(out), docling_pages or "")) as pool:
+            for i, result in enumerate(
+                    pool.map(_worker_one, [str(p) for p in pdfs], chunksize=1), 1):
+                store(result, i)
+    else:
+        splitter = chunking.ElementSplitter()
+        for i, pdf in enumerate(pdfs, start=1):
+            try:
+                parsed = parser.parse(pdf)
+            except parsers.ParserUnavailable as exc:
+                if parser.name == "docling":
+                    print("  ! Docling unavailable (%s) — falling back to pdfplumber" % exc)
+                    parser = parsers.get_parser("pdfplumber")
+                    fallback_used = True
+                    try:
+                        parsed = parser.parse(pdf)
+                    except Exception as exc2:
+                        print("  x %s: %s" % (pdf.name, exc2))
+                        skipped += 1
+                        continue
+                else:
+                    print("  x %s: %s" % (pdf.name, exc))
+                    skipped += 1
+                    continue
+            except Exception as exc:
+                print("  x %s: %s" % (pdf.name, exc))
+                skipped += 1
+                continue
+
+            meta = metadata.enrich(parsed)
+            chunks = chunking.chunk_document(parsed, meta, splitter=splitter)
+            (out / "parsed" / (parsed.doc_id + ".md")).write_text(
+                parsed.markdown, encoding="utf-8")
+            (out / "parsed" / (parsed.doc_id + ".meta.json")).write_text(
+                json.dumps(meta.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+            store({
+                "ok": True,
+                "doc": {
+                    "doc_id": parsed.doc_id, "filename": parsed.filename,
+                    "sha1": parsed.sha1, "n_pages": parsed.n_pages,
+                    "parser": parsed.parser, "part": meta.part,
+                    "manufacturer": meta.manufacturer, "package": meta.package,
+                    "family": meta.family, "conf": meta.confidence,
+                },
+                "chunks": [c.to_dict() for c in chunks],
+                "n_chunks": len(chunks),
+            }, i)
 
     built_vectors = index.build_vectors() if embedder.name != "none" else 0
     index.set_meta("parser", (parser.name + (" (fallback)" if fallback_used else "")))
     index.set_meta("built_at", time.strftime("%Y-%m-%d %H:%M:%S"))
-    index.set_meta("chunker", splitter.backend)
+    index.set_meta("chunker", chunker_name)
 
     stats = index.stats()
+    # The printed line always had `skipped`; callers could not see it.
+    stats["indexed"] = ok
+    stats["skipped"] = skipped
     print(
         "\nDone in %.1fs: %d indexed, %d skipped, %d chunks (%d tables), %d vectors"
         % (time.time() - t0, ok, skipped, total_chunks, stats["tables"], built_vectors)
@@ -189,6 +279,10 @@ def main() -> int:
                     choices=["none", "auto", "sentence-transformers", "st", "openai"])
     ap.add_argument("--rebuild", action="store_true", help="drop the existing index first")
     ap.add_argument("--limit", type=int, default=0, help="process only the first N PDFs")
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="parallel workers for parsing and chunking "
+                         "(default: number of cores). The index write stays "
+                         "in one process either way")
     ap.add_argument("--query", help="run a search instead of building")
     ap.add_argument("--part", help="restrict the search to one part number")
     ap.add_argument("--section", help="restrict the search to one canonical section")
@@ -206,7 +300,7 @@ def main() -> int:
         return 0
     build(args.corpus, args.out, args.parser, args.embed, args.rebuild, args.limit,
           args.verbose, backend=args.backend or "auto",
-          docling_pages=args.docling_pages)
+          docling_pages=args.docling_pages, jobs=args.jobs)
     return 0
 
 

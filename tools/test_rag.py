@@ -146,6 +146,41 @@ def run(tmp: Path, corpus: Path, out: Path) -> int:
     print("\n--- API (как его видит браузер) ---")
     api_smoke(index)
 
+    print("\n--- параллельная индексация (pipeline --jobs) ---")
+    from tools.rag import pipeline
+
+    (corpus / "broken.pdf").write_bytes(b"this is not a pdf")
+    seq_out = tmp / "index-seq"
+    par_out = tmp / "index-par"
+    stats1 = pipeline.build(corpus, seq_out, "pdfplumber", "none",
+                            rebuild=True, jobs=1, verbose=False)
+    stats4 = pipeline.build(corpus, par_out, "pdfplumber", "none",
+                            rebuild=True, jobs=4, verbose=False)
+    check("один воркер: 6 проиндексировано, битый пропущен",
+          stats1.get("docs") == 6 and stats1.get("skipped") == 1, str(stats1.get("skipped")))
+    check("четыре воркера дают столько же документов",
+          stats4.get("docs") == stats1.get("docs"), str(stats4))
+    check("четыре воркера дают столько же чанков",
+          stats4.get("chunks") == stats1.get("chunks"),
+          "%s != %s" % (stats4.get("chunks"), stats1.get("chunks")))
+    check("битый файл не роняет параллельный прогон",
+          stats4.get("skipped") == 1 and stats4.get("docs") == 6,
+          str(stats4.get("skipped")))
+    check("markdown кэш записан и в параллельном режиме",
+          len(list((par_out / "parsed").glob("*.md"))) == 6,
+          str(len(list((par_out / "parsed").glob("*.md")))))
+
+    idx_par = index_db.RagIndex(par_out / "index.db")
+    idx_seq = index_db.RagIndex(seq_out / "index.db")
+    hits_par = idx_par.search("collector current", k=5)
+    hits_seq = idx_seq.search("collector current", k=5)
+    check("поиск по параллельному индексу работает", len(hits_par) > 0, str(hits_par)[:120])
+    check("результаты поиска те же, что при одном воркере",
+          [h.get("doc_id") for h in hits_par] == [h.get("doc_id") for h in hits_seq],
+          "%s != %s" % (hits_par[:1], hits_seq[:1]))
+    idx_par.close(); idx_seq.close()
+    (corpus / "broken.pdf").unlink()
+
     print("\n--- SigV4 против botocore ---")
     sigv4_smoke()
 
