@@ -338,6 +338,105 @@ def main() -> int:
         no_key = "SMD_E14_KEY" in str(exc) or "partner.element14.com" in str(exc)
     check("нет ключа — понятное сообщение, а не трейс", no_key)
 
+    print("\n--- один вызов накрывает серию ---")
+    # Запрос «RC0402FR-071KL» приносит и соседей по серии: manuPartNum ищет
+    # по вхождению. На бюджете 50 000 вызовов это и есть объём.
+    series = [product("RC0402FR-071KL", brand="YAGEO", datasheet="https://x/1k.pdf"),
+              product("RC0402FR-072KL", brand="YAGEO", datasheet="https://x/2k.pdf"),
+              product("RC0402FR-073KL", brand="YAGEO", datasheet="https://x/3k.pdf")]
+    fake13 = Fake([(200, payload(series), {})])
+    e14 = client(fake13, tmp / "series")
+    best, found = e14.lookup_all("RC0402FR-071KL")
+    check("lookup_all отдаёт и точное совпадение, и весь ответ",
+          best["part"] == "RC0402FR-071KL" and len(found) == 3, str(found))
+    check("на серию ушёл один вызов", e14.calls == 1, str(e14.calls))
+    check("lookup по-прежнему отдаёт только лучший товар",
+          e14.lookup("RC0402FR-071KL")["part"] == "RC0402FR-071KL")
+
+    series_file = tmp / "series.txt"
+    series_file.write_text("RC0402FR-071KL\nRC0402FR-072KL\nRC0402FR-073KL\n",
+                           encoding="utf-8")
+    fake14 = Fake([(200, payload(series), {})])
+    element14._default_opener = fake14
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        element14.main(["--parts", str(series_file), "--to-csv", str(tmp / "s.csv"),
+                        "--api-key", "testkey000000000000000abc",
+                        "--cache", str(tmp / "s-cache.sqlite3")])
+    text = buf.getvalue()
+    check("прогон по серии покрыл все позиции одним вызовом",
+          "накрыто 3 из 3" in text and "вызовов API:         1" in text, text[-500:])
+    check("отчёт показывает детали на вызов", "деталей на вызов: 3.0" in text,
+          text[-500:])
+    check("и прогноз на сутки", "до 150000 деталей в сутки" in text, text[-500:])
+    check("в CSV все три позиции",
+          len(fetch_datasheets.read_list(tmp / "s.csv")) == 3)
+
+    print("\n--- потолок пагинации ---")
+    page_full = payload([product("P%d" % i) for i in range(3)], total=100)
+    fake15 = Fake([(200, page_full, {}), (200, page_full, {}), (200, payload([]), {})])
+    e14 = client(fake15, tmp / "probe")
+    report = element14.probe_limits(e14, "any:mosfet", per_page=3, max_pages=10)
+    check("сколько товаров реально приходит на вызов",
+          report["per_page_got"] == 3, str(report))
+    check("глубина пагинации измерена",
+          report["pages"] == 2 and report["max_offset"] == 3, str(report))
+    check("причина остановки названа", "пустая" in report["stopped_on"],
+          report["stopped_on"])
+    check("пустая первая страница не ломает отчёт",
+          element14.probe_limits(client(Fake([(200, payload([]), {})]), tmp / "p2"),
+                                 per_page=3)["per_page_got"] == 0)
+    check("неполная страница — тоже причина остановки",
+          "неполная" in element14.probe_limits(
+              client(Fake([(200, payload([product("A")]), {})]), tmp / "p3"),
+              per_page=3)["stopped_on"])
+
+    print("\n--- обход каталога списком запросов ---")
+    q_file = tmp / "queries.txt"
+    q_file.write_text("any:mosfet\n# comment\nany:ldo\n", encoding="utf-8")
+    fake16 = Fake([(200, payload([product("M1", datasheet="https://x/m1.pdf"),
+                                  product("M2", datasheet="https://x/m2.pdf")]), {}),
+                   (200, payload([product("M2", datasheet="https://x/m2.pdf"),
+                                  product("L1", datasheet="https://x/l1.pdf")]), {})])
+    e14 = client(fake16, tmp / "sweep")
+    rows = element14.sweep(e14, q_file.read_text(encoding="utf-8").splitlines(),
+                           per_page=3, max_pages=2)
+    check("обход собирает позиции из всех запросов",
+          [r["part"] for r in rows] == ["M1", "M2", "L1"],
+          str([r["part"] for r in rows]))
+    check("комментарии в списке запросов пропущены", e14.calls == 2, str(e14.calls))
+    check("дубли между запросами отброшены",
+          len({r["part"] for r in rows}) == 3)
+
+    state_path = tmp / "state.json"
+    fake17 = Fake([(200, payload([product("M1", datasheet="https://x/m1.pdf")]), {}),
+                   (200, payload([product("L1", datasheet="https://x/l1.pdf")]), {})])
+    element14._default_opener = fake17
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        element14.main(["--queries", str(q_file), "--state", str(state_path),
+                        "--to-csv", str(tmp / "q.csv"),
+                        "--api-key", "testkey000000000000000abc",
+                        "--cache", str(tmp / "q-cache.sqlite3"), "--max-pages", "1"])
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    check("state запоминает сделанные запросы",
+          sorted(saved["done"]) == ["any:ldo", "any:mosfet"], str(saved["done"]))
+    check("state запоминает виденные позиции",
+          sorted(saved["seen"]) == ["L1", "M1"], str(saved["seen"]))
+    fake18 = Fake([])          # транспорт без ответов: всё должно быть в кэше
+    element14._default_opener = fake18
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        rc = element14.main(["--queries", str(q_file), "--state", str(state_path),
+                             "--to-csv", str(tmp / "q2.csv"),
+                             "--api-key", "testkey000000000000000abc",
+                             "--cache", str(tmp / "q-cache.sqlite3"),
+                             "--max-pages", "1"])
+    check("второй день не повторяет сделанные запросы",
+          "Осталось" not in buf.getvalue() and rc == 0, buf.getvalue()[:200])
+    check("и не тратит ни одного вызова",
+          "вызовов API:         0" in buf.getvalue(), buf.getvalue()[-400:])
+
     print("\n--- итог ---")
     print("%d пройдено, %d провалено" % (PASS, FAIL))
     return 1 if FAIL else 0

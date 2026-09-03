@@ -2,8 +2,23 @@
 """element14 / Farnell / Newark Product Search API -> part list for the corpus.
 
     python3 tools/rag/element14.py --check
+    python3 tools/rag/element14.py --probe-limits "any:mosfet"
     python3 tools/rag/element14.py --parts parts.txt --to-csv parts-e14.csv
-    python3 tools/rag/element14.py --browse "any:microcontroller" --max-pages 5
+    python3 tools/rag/element14.py --queries queries.txt --state sweep.json
+
+**50 000 вызовов в сутки — это не 50 000 деталей.** Лимит считается по
+вызовам, а один вызов приносит до 100 товаров:
+
+* `--parts` — запрос по парт-номеру (`manuPartNum:`), но ответ содержит и
+  соседей по серии. Один вызов накрывает всю серию: RC0402FR-071KL приносит
+  и -072KL, и -073KL. Прогон печатает «деталей на вызов» — это и есть
+  настоящая цена одной детали из бюджета;
+* `--queries` — обход каталога списком запросов, до 100 позиций за вызов,
+  со state-файлом, чтобы завтрашний прогон не повторял сегодняшние запросы.
+
+Что именно даёт API на самом деле (сколько товаров на вызов и как глубоко
+пускает пагинация), в документации не сказано — `--probe-limits` измеряет это
+за 10–20 вызовов и сразу печатает прогноз на сутки.
 
 Зачем это, если есть каталог JLCPCB/LCSC и `--prefer-vendor`:
 
@@ -253,15 +268,31 @@ class Element14:
         except (TypeError, ValueError):
             return 0
 
-    def lookup(self, part: str, in_stock: bool = False) -> Optional[Dict[str, Any]]:
-        """Один парт-номер производителя -> лучший товар из каталога."""
+    def lookup_all(self, part: str, in_stock: bool = False
+                   ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Один парт-номер -> (лучший товар, всё что пришло в ответе).
+
+        Второе — не мусор. `manuPartNum:` ищет по вхождению, поэтому ответ на
+        запрос «RC0402FR-071KL» часто содержит и RC0402FR-072KL, и остальные
+        позиции серии: **один вызов покрывает всю серию**. На бюджете
+        50 000 вызовов в сутки это и есть разница между 50 000 деталями и
+        несколькими сотнями тысяч.
+        """
         payload = self.raw("manuPartNum:%s" % part, number=MAX_PER_PAGE,
                            filters="inStock" if in_stock else "")
+        rows = [self.to_row(product) for product in self.products_of(payload)]
+        rows = [row for row in rows if row["part"]]
+        best = self._best_of(rows, part)
+        return best, rows
+
+    def lookup(self, part: str, in_stock: bool = False) -> Optional[Dict[str, Any]]:
+        """Один парт-номер производителя -> лучший товар из каталога."""
+        return self.lookup_all(part, in_stock=in_stock)[0]
+
+    @staticmethod
+    def _best_of(rows: List[Dict[str, Any]], part: str) -> Optional[Dict[str, Any]]:
         best: Optional[Dict[str, Any]] = None
-        for product in self.products_of(payload):
-            row = self.to_row(product)
-            if not row["part"]:
-                continue
+        for row in rows:
             # точное совпадение парт-номера важнее всего: manuPartNum ищет
             # и по вхождению, а пересортица по семействам нам не нужна
             exact = row["part"].upper().replace(" ", "") == part.upper().replace(" ", "")
@@ -357,6 +388,74 @@ class Element14:
             unit = (item.get("attributeUnit") or "").strip()
             out[label] = ("%s %s" % (value, unit)).strip()
         return out
+
+
+def probe_limits(client: "Element14", term: str = "any:mosfet",
+                 per_page: int = MAX_PER_PAGE, max_pages: int = 20) -> Dict[str, Any]:
+    """Сколько реально даёт один вызов и как глубоко пускает пагинация.
+
+    Потолок `numberOfResults` и глубина `offset` в документации не указаны, а
+    от них зависит всё: если вызов даёт 100 товаров и пускает на 10 страниц,
+    то один запрос — это 1 000 позиций, и 50 000 вызовов в сутки перестают
+    быть ограничением. Стоимость проверки — до 20 вызовов, один раз.
+    """
+    asked = max(1, min(int(per_page), MAX_PER_PAGE))
+    payload = client.raw(term, offset=0, number=asked)
+    products = client.products_of(payload)
+    out: Dict[str, Any] = {
+        "term": term,
+        "per_page_asked": asked,
+        "per_page_got": len(products),
+        "total_reported": client.total_of(payload),
+        "pages": 1,
+        "max_offset": 0,
+        "stopped_on": "первая страница пустая" if not products else "",
+    }
+    if len(products) < asked:
+        out["stopped_on"] = ("страница неполная (%d из %d)"
+                             % (len(products), asked))
+        return out
+    for page in range(1, max_pages):
+        payload = client.raw(term, offset=page * asked, number=asked)
+        products = client.products_of(payload)
+        out["calls"] = client.calls
+        if not products:
+            out["stopped_on"] = "страница %d пустая" % (page + 1)
+            break
+        out["pages"] = page + 1
+        out["max_offset"] = page * asked
+        if len(products) < asked:
+            out["stopped_on"] = "страница %d неполная" % (page + 1)
+            break
+    else:
+        out["stopped_on"] = "дошли до --max-pages, потолок не найден"
+    return out
+
+
+def sweep(client: "Element14", queries: List[str], per_page: int = MAX_PER_PAGE,
+          max_pages: int = 10, in_stock: bool = False,
+          seen: Optional[set] = None) -> List[Dict[str, Any]]:
+    """Обход каталога списком запросов: один вызов — до `per_page` товаров.
+
+    Это режим объёма. Парт-номерные lookup'ы дают деталь на вызов; здесь
+    вызов стоит до ста позиций. Прогон останавливается, когда кончился дневной
+    бюджет, а список сделанных запросов сохраняется в state-файл — завтра
+    продолжаем с того же места, ничего не повторяя.
+    """
+    seen = set() if seen is None else seen
+    rows: List[Dict[str, Any]] = []
+    for query in queries:
+        query = query.strip()
+        if not query or query.startswith("#"):
+            continue
+        for row in client.browse(query, max_pages=max_pages, per_page=per_page,
+                                 in_stock=in_stock):
+            key = (row.get("part") or "").upper()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+    return rows
 
 
 def _package_of(product: Dict[str, Any], attributes: Dict[str, str]) -> str:
@@ -547,8 +646,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--parts", type=Path, help="txt/csv/json со списком парт-номеров")
     ap.add_argument("--browse", default="",
                     help="поисковый запрос вместо списка: any:fuse, any:mosfet…")
+    ap.add_argument("--queries", type=Path, default=None,
+                    help="файл запросов (по строке) для обхода каталога: "
+                         "один вызов — до --per-page позиций")
+    ap.add_argument("--state", type=Path, default=None,
+                    help="JSON со сделанными запросами: обход продолжается "
+                         "на следующий день, не повторяясь")
+    ap.add_argument("--probe-limits", default="",
+                    metavar="TERM",
+                    help="измерить, сколько товаров реально даёт один вызов и "
+                         "как глубоко пускает пагинация (до --max-pages вызовов)")
     ap.add_argument("--to-csv", type=Path, default=Path("parts-element14.csv"),
                     help="куда писать список (формат fetch_datasheets --list)")
+    ap.add_argument("--bonus-out", action="store_true",
+                    help="добавить в список и то, что пришло попутно, но не "
+                         "было в списке парт-номеров (дармовые позиции)")
     ap.add_argument("--attributes-out", type=Path, default=None,
                     help="JSONL с атрибутами — задел на обогащение карточек")
     ap.add_argument("--limit", type=int, default=0, help="сколько парт-номеров взять")
@@ -578,11 +690,53 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.check:
         return check(client)
 
+    if args.probe_limits:
+        report = probe_limits(client, args.probe_limits or "any:mosfet",
+                              per_page=args.per_page, max_pages=args.max_pages)
+        print("Запрос:            %s" % report["term"])
+        print("Просили на вызов:  %d" % report["per_page_asked"])
+        print("Пришло на вызов:   %d" % report["per_page_got"])
+        print("Всего по запросу:  %d" % report["total_reported"])
+        print("Страниц пройдено:  %d (offset до %d)"
+              % (report["pages"], report["max_offset"]))
+        print("Остановились на:   %s" % report["stopped_on"])
+        print("Вызовов потрачено: %d, осталось сегодня %d"
+              % (client.calls, client.remaining_today()))
+        per_call = report["per_page_got"]
+        depth = report["pages"]
+        if per_call:
+            print("\nОдин запрос даёт до %d позиций — при дневном бюджете "
+                  "%d вызовов это до %d позиций в сутки."
+                  % (per_call * depth, client.day_limit,
+                     per_call * depth * (client.day_limit // max(1, depth))))
+        return 0
+
     started = time.time()
     rows: List[Dict[str, Any]] = []
     asked = 0
     try:
-        if args.browse:
+        if args.queries:
+            state = _load_state(args.state)
+            done = set(state.get("done") or [])
+            queries = [q.strip() for q in
+                       args.queries.read_text(encoding="utf-8").splitlines()
+                       if q.strip() and not q.startswith("#")]
+            todo = [q for q in queries if q not in done]
+            print("Запросов: %d (уже сделано %d)   осталось вызовов сегодня: %d"
+                  % (len(queries), len(done), client.remaining_today()))
+            seen = set(state.get("seen") or [])
+            rows.extend(sweep(client, todo, per_page=args.per_page,
+                              max_pages=args.max_pages, in_stock=args.in_stock,
+                              seen=seen))
+            # что успели, то и запомним: завтра начнём со следующего запроса
+            for i, query in enumerate(todo):
+                done.add(query)
+                if client.remaining_today() <= 0 and i < len(todo) - 1:
+                    break
+            _save_state(args.state, sorted(done), seen)
+            print("  собрано %d позиций, вызовов %d, осталось %d"
+                  % (len(rows), client.calls, client.remaining_today()))
+        elif args.browse:
             rows = client.browse(args.browse, max_pages=args.max_pages,
                                  per_page=args.per_page, in_stock=args.in_stock)
             asked = client.total_of(client.raw(args.browse, number=1))
@@ -590,19 +744,44 @@ def main(argv: Optional[List[str]] = None) -> int:
             parts = read_parts(args.parts, args.limit)
             print("Парт-номеров: %d   осталось вызовов сегодня: %d"
                   % (len(parts), client.remaining_today()))
+            wanted = {p.upper(): p for p in parts}
+            covered: Dict[str, Dict[str, Any]] = {}
+            bonus: Dict[str, Dict[str, Any]] = {}
+            calls_before = 0
             for i, part in enumerate(parts, 1):
+                if part.upper() in covered:      # серия уже накрыта соседом
+                    continue
                 try:
-                    row = client.lookup(part, in_stock=args.in_stock)
+                    row, found = client.lookup_all(part, in_stock=args.in_stock)
                 except BudgetExhausted as exc:
                     print("\nОстановлено: %s" % exc)
                     break
-                if row:
-                    rows.append(row)
+                # Один вызов приносит всю серию: manuPartNum ищет по
+                # вхождению, поэтому в ответе лежат и соседние позиции.
+                for item in found:
+                    key = (item.get("part") or "").upper()
+                    if key in wanted:
+                        covered.setdefault(key, item)
+                    else:
+                        bonus.setdefault(key, item)
                 if args.verbose or i % 25 == 0 or i == len(parts):
-                    with_pdf = sum(1 for r in rows if r.get("url"))
-                    print("  %5d/%d  найдено %d  с PDF %d  вызовов %d (кэш %d)"
-                          % (i, len(parts), len(rows), with_pdf, client.calls,
-                             client.cache_hits), flush=True)
+                    print("  %5d/%d  покрыто %d  с PDF %d  вызовов %d (кэш %d)"
+                          "  деталей на вызов %.1f"
+                          % (i, len(parts), len(covered),
+                             sum(1 for r in covered.values() if r.get("url")),
+                             client.calls, client.cache_hits,
+                             len(covered) / max(1, client.calls)), flush=True)
+            rows.extend(covered.values())
+            if args.bonus_out:
+                rows.extend(bonus.values())
+            print("  накрыто %d из %d парт-номеров, попутно собрано %d "
+                  "позиций мимо списка"
+                  % (len(covered), len(wanted), len(bonus)))
+            if client.calls:
+                print("  деталей на вызов: %.1f (бюджет %d вызовов => до %d "
+                      "деталей в сутки)"
+                      % (len(covered) / client.calls, client.day_limit,
+                         int(len(covered) / client.calls * client.day_limit)))
         else:
             ap.error("нужен --parts, --browse или --check")
     except BudgetExhausted as exc:
@@ -633,6 +812,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("(--ignore-robots: ссылки на farnell.com/datasheets выданы самим API,")
         print(" мы пришли по нему, а не обходом сайта)")
     return 0
+
+
+def _load_state(path: Optional[Path]) -> Dict[str, Any]:
+    if not path or not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}
+
+
+def _save_state(path: Optional[Path], done: List[str], seen: set) -> None:
+    """Что уже пройдено — чтобы завтрашний прогон не тратил вызовы впустую."""
+    if not path:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"done": done, "seen": sorted(seen)[:200000],
+                                "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                         time.gmtime())},
+                               ensure_ascii=False), encoding="utf-8")
 
 
 def _fmt_time(seconds: float) -> str:
