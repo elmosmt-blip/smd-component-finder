@@ -13,6 +13,7 @@
     "test:rag": "python3 tools/test_rag.py",
     "test:cards": "python3 tools/test_cards.py",
     "test:element14": "python3 tools/test_element14.py",
+    "test:cardindex": "python3 tools/test_card_index.py",
     "cards": "python3 tools/rag/build_cards.py"
   },
   "devDependencies": {

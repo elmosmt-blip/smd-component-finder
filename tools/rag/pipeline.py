@@ -432,6 +432,10 @@ def main() -> int:
                     help="parallel workers for parsing and chunking "
                          "(default: number of cores). The index write stays "
                          "in one process either way")
+    ap.add_argument("--from-cards", type=Path, metavar="CARDS.DB",
+                    help="индексировать не PDF, а готовые карточки: в 100 раз "
+                         "меньше индекс и никакого Docling "
+                         "(см. tools/rag/index_cards.py)")
     ap.add_argument("--no-reuse-parsed", action="store_true",
                     help="ignore parsed/*.chunks.json and parse everything again")
     ap.add_argument("--no-resume", action="store_true",
@@ -455,6 +459,12 @@ def main() -> int:
     if args.stats:
         idx = opensearch_index.open_index(args.out / "index.db")
         print(json.dumps(idx.stats(), indent=2, ensure_ascii=False))
+        return 0
+    if args.from_cards:
+        from tools.rag import index_cards
+        index_cards.build(args.from_cards, args.out, rebuild=args.rebuild,
+                          limit=args.limit, embed=args.embed,
+                          backend=args.backend or "auto", verbose=args.verbose)
         return 0
     if args.check or args.repair:
         idx = opensearch_index.open_index(args.out / "index.db")
