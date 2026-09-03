@@ -1364,6 +1364,20 @@
         }).join('') + '</div></div>';
     }
 
+    if ((c.extra_specs || []).length) {
+      var srcName = (c.extra_specs[0] && c.extra_specs[0].source) || 'distributor';
+      out += '<div class="card-section"><h4>From ' + esc(srcName) + ' (' +
+        c.extra_specs.length + ')</h4>' +
+        '<table class="card-table"><thead><tr><th>Parameter</th><th>Value</th>' +
+        '</tr></thead><tbody>' +
+        c.extra_specs.map(function (x) {
+          return '<tr><td>' + esc(x.label) + '</td><td class="num">' +
+                 esc(x.value) + '</td></tr>';
+        }).join('') + '</tbody></table>' +
+        '<div class="pcard-foot">Distributor data, not extracted from the datasheet.</div>' +
+        '</div>';
+    }
+
     out += '<div class="card-section"><h4>Source</h4><div class="pcard-foot">' +
       esc(c.filename || '') + ' · ' + (c.pages || 0) + ' pages · ' + (c.tables || 0) +
       ' tables · parsed by ' + esc(c.parser || '?') +

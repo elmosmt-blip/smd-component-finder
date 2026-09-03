@@ -63,9 +63,12 @@ FIELD_SECTION = {
     "specs": "electrical_characteristics",
     "dimensions": "package_dimensions",
     "order_codes": "ordering_information",
+    # Данные дистрибьютора (element14): свой блок, не смешивать с разбором PDF.
+    "extra_specs": "other",
 }
 
-TABLE_FIELDS = frozenset({"pins", "ratings", "specs", "dimensions", "order_codes"})
+TABLE_FIELDS = frozenset({"pins", "ratings", "specs", "dimensions", "order_codes",
+                          "extra_specs"})
 
 
 # --------------------------------------------------------------------------- #
@@ -137,6 +140,13 @@ def _render(field: str, value: Any) -> Tuple[str, str]:
         summary = "dimensions: %s" % _one_line(
             ["%s %s" % (r[0], r[1]) for r in rows])
         return _table(["Dimension", "Value"], rows), summary
+    if field == "extra_specs":
+        rows = [[_cell(e.get("label")), _cell(e.get("value")),
+                 _cell(e.get("source"))] for e in (value or [])]
+        summary = "from %s: %s" % (
+            _cell((value or [{}])[0].get("source")) or "distributor",
+            _one_line([": ".join(r[:2]) for r in rows[:6]]))
+        return _table(["Parameter", "Value", "Source"], rows), summary
     if field == "order_codes":
         rows = [[_cell(o.get("code")), _cell(o.get("package")),
                  _cell(o.get("marking"))] for o in (value or [])]

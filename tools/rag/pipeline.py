@@ -436,6 +436,11 @@ def main() -> int:
                     help="индексировать не PDF, а готовые карточки: в 100 раз "
                          "меньше индекс и никакого Docling "
                          "(см. tools/rag/index_cards.py)")
+    ap.add_argument("--enrich", type=Path, metavar="ATTRS.JSONL",
+                    help="сначала добавить карточкам атрибуты дистрибьютора "
+                         "(element14.py --attributes-out), потом индексировать. "
+                         "Пустые поля заполняются, остальное идёт в отдельный "
+                         "блок extra_specs, confidence не растёт")
     ap.add_argument("--no-reuse-parsed", action="store_true",
                     help="ignore parsed/*.chunks.json and parse everything again")
     ap.add_argument("--no-resume", action="store_true",
@@ -460,10 +465,17 @@ def main() -> int:
         idx = opensearch_index.open_index(args.out / "index.db")
         print(json.dumps(idx.stats(), indent=2, ensure_ascii=False))
         return 0
-    if args.from_cards:
-        from tools.rag import index_cards
-        index_cards.build(args.from_cards, args.out, rebuild=args.rebuild,
-                          limit=args.limit, embed=args.embed,
+    if args.from_cards or args.enrich:
+        from tools.rag import enrich_cards, index_cards
+        cards_db = args.from_cards
+        if args.enrich:
+            cards_db = cards_db or Path(os.environ.get("SMD_CARDS_DB")
+                                        or (args.out.parent / "cards" / "cards.db"))
+            enrich_cards.enrich(cards_db, args.enrich, limit=args.limit,
+                                verbose=args.verbose)
+        index_cards.build(cards_db, args.out, rebuild=args.rebuild,
+                          limit=0 if args.enrich else args.limit,
+                          embed=args.embed,
                           backend=args.backend or "auto", verbose=args.verbose)
         return 0
     if args.check or args.repair:

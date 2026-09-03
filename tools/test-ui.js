@@ -78,7 +78,10 @@ const API = {
     dimensions: { body_length: { value: 2.9, unit: 'mm' } },
     order_codes: [{ code: 'SI2301BDS', package: 'SOT-23', marking: 'A1' }],
     headline: [{ label: 'Drain-source voltage', value: -20, unit: 'V', text: '-20 V',
-                 key: 'drain_source_voltage', page: 1 }] },
+                 key: 'drain_source_voltage', page: 1 }],
+    extra_specs: [{ label: 'Transistor Case Style', value: 'SOT-23', source: 'element14' },
+                  { label: 'Drain Source Voltage Vds', value: '20 V', source: 'element14' },
+                  { label: 'Operating Temperature Max', value: '150 °C', source: 'element14' }] },
   '/api/parts': { parts: [
     { part: 'MMBT3904', manufacturer: 'Diodes Inc.', package: 'SOT-23', n: 18 },
     { part: 'SI2301', manufacturer: 'Vishay', package: 'SOT-23', n: 12 }] }
@@ -255,6 +258,12 @@ check(' есть таблица характеристик', /RDS\(on\)/.test(mo
   (modal.textContent.match(/RDS.{0,60}/) || [''])[0]);
 check(' есть габариты и коды заказа', /2\.9 mm/.test(modal.textContent) && /A1/.test(modal.textContent));
 check(' есть ссылка на исходный PDF', /SI2301_datasheet\.pdf/.test(modal.innerHTML));
+check(' данные дистрибьютора — отдельным блоком, а не в характеристиках',
+  /From element14 \(3\)/.test(modal.textContent) &&
+  /Transistor Case Style/.test(modal.textContent) &&
+  /SOT-23/.test(modal.textContent));
+check(' блок дистрибьютора помечен как не вытащенный из PDF',
+  /not extracted from the datasheet/.test(modal.textContent));
 
 // закрытие по Escape
 doc.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));

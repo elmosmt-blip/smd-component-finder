@@ -14,6 +14,7 @@
     "test:cards": "python3 tools/test_cards.py",
     "test:element14": "python3 tools/test_element14.py",
     "test:cardindex": "python3 tools/test_card_index.py",
+    "test:enrich": "python3 tools/test_enrich.py",
     "cards": "python3 tools/rag/build_cards.py"
   },
   "devDependencies": {
