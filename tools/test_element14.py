@@ -437,6 +437,81 @@ def main() -> int:
     check("и не тратит ни одного вызова",
           "вызовов API:         0" in buf.getvalue(), buf.getvalue()[-400:])
 
+    print("\n--- не тратим вызовы на то, что уже есть ---")
+    cards_db = tmp / "cards.db"
+    import sqlite3 as _sql
+    con = _sql.connect(str(cards_db))
+    con.execute("CREATE TABLE cards (part TEXT PRIMARY KEY, part_key TEXT NOT NULL,"
+                " manufacturer TEXT, package TEXT, confidence REAL, card TEXT)")
+    con.executemany(
+        "INSERT INTO cards VALUES (?,?,?,?,?,?)",
+        [("GOOD1", "GOOD1", "ONSEMI", "SOT-23", 0.9, "{}"),
+         ("NOPKG", "NOPKG", "ONSEMI", "", 0.9, "{}"),      # нет корпуса — идём в API
+         ("WEAK1", "WEAK1", "ONSEMI", "SOT-23", 0.2, "{}"),  # низкая уверенность
+         ("NOMFR", "NOMFR", "", "SOT-23", 0.9, "{}")])
+    con.commit(); con.close()
+    good = element14.load_known_good(cards_db)
+    # порог 0 — «любая карточка с производителем и корпусом годилась»
+    check("хорошие карточки распознаны", good == {"GOOD1", "WEAK1"}, str(good))
+    check("без корпуса или производителя — не помеха",
+          "NOPKG" not in good and "NOMFR" not in good, str(good))
+    check("порог уверенности работает",
+          "WEAK1" in element14.load_known_good(cards_db, min_confidence=0.1)
+          and "WEAK1" not in element14.load_known_good(cards_db, min_confidence=0.5),
+          str(element14.load_known_good(cards_db, min_confidence=0.5)))
+    check("нет файла — просто пустое множество",
+          element14.load_known_good(tmp / "nope.db") == set())
+
+    print("\n--- прогноз по дням ---")
+    check("всё покрыто — без дней", element14.plan_eta(0, 50000, 8) == "всё покрыто",
+          element14.plan_eta(0, 50000, 8))
+    check("50 000 деталей — один день", "1 дн." in element14.plan_eta(50000, 50000, 8),
+          element14.plan_eta(50000, 50000, 8))
+    check("300 000 деталей — шесть дней",
+          "6 дн." in element14.plan_eta(300000, 50000, 8),
+          element14.plan_eta(300000, 50000, 8))
+    check("время работы в день посчитано", "1.7 ч" in element14.plan_eta(300000, 50000, 8),
+          element14.plan_eta(300000, 50000, 8))
+
+    print("\n--- прогон: пропуск готового и остаток на завтра ---")
+    parts_file = tmp / "plan.txt"
+    parts_file.write_text("GOOD1\nNEW1\nNEW2\n", encoding="utf-8")
+    fake19 = Fake([(200, payload([product("NEW1", datasheet="https://x/n1.pdf")]), {}),
+                   (200, payload([]), {})])
+    element14._default_opener = fake19
+    plan_out = tmp / "tomorrow.txt"
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        element14.main(["--parts", str(parts_file), "--to-csv", str(tmp / "p.csv"),
+                        "--api-key", "testkey000000000000000abc",
+                        "--cache", str(tmp / "p-cache.sqlite3"),
+                        "--skip-good", str(cards_db),
+                        "--plan-out", str(plan_out), "--day-limit", "1"])
+    text = buf.getvalue()
+    check("по готовой карточке вызов не делается",
+          "уже есть хорошая карточка: 1" in text and "к обработке: 2" in text,
+          text[:300])
+    check("прогноз напечатан", "Прогноз:" in text, text[:300])
+    check("NEW2 остался на завтра (бюджет кончился на NEW1)",
+          plan_out.exists() and plan_out.read_text(encoding="utf-8").split() == ["NEW2"],
+          str(plan_out.read_text(encoding="utf-8") if plan_out.exists() else None))
+
+    print("\n--- чего нет в каталоге, считаем отдельно ---")
+    fake20 = Fake([(200, payload([product("NEW1", datasheet="https://x/n1.pdf")]), {}),
+                   (200, payload([]), {})])
+    element14._default_opener = fake20
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        element14.main(["--parts", str(parts_file), "--to-csv", str(tmp / "p2.csv"),
+                        "--api-key", "testkey000000000000000abc",
+                        "--cache", str(tmp / "p2-cache.sqlite3"),
+                        "--skip-good", str(cards_db)])
+    text = buf.getvalue()
+    check("чего нет в каталоге, посчитано отдельно",
+          "нет в каталоге element14: 1" in text, text[-500:])
+    check("и это не попадает в остаток на завтра",
+          "осталось необработанных" not in text, text[-500:])
+
     print("\n--- итог ---")
     print("%d пройдено, %d провалено" % (PASS, FAIL))
     return 1 if FAIL else 0

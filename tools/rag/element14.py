@@ -663,6 +663,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "было в списке парт-номеров (дармовые позиции)")
     ap.add_argument("--attributes-out", type=Path, default=None,
                     help="JSONL с атрибутами — задел на обогащение карточек")
+    ap.add_argument("--skip-good", type=Path, default=None, metavar="CARDS.DB",
+                    help="не тратить вызовы на детали, у которых в cards.db "
+                         "уже есть карточка с производителем и корпусом")
+    ap.add_argument("--min-confidence", type=float, default=0.0,
+                    help="вместе с --skip-good: считать карточку хорошей "
+                         "только при уверенности не ниже этой")
+    ap.add_argument("--plan-out", type=Path, default=None,
+                    help="куда записать необработанный остаток — список "
+                         "для завтрашнего прогона")
     ap.add_argument("--limit", type=int, default=0, help="сколько парт-номеров взять")
     ap.add_argument("--max-pages", type=int, default=5,
                     help="страниц в режиме --browse")
@@ -742,13 +751,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             asked = client.total_of(client.raw(args.browse, number=1))
         elif args.parts:
             parts = read_parts(args.parts, args.limit)
-            print("Парт-номеров: %d   осталось вызовов сегодня: %d"
-                  % (len(parts), client.remaining_today()))
+            known = load_known_good(args.skip_good, args.min_confidence)
+            todo = [p for p in parts if p.upper() not in known]
+            print("Парт-номеров: %d   уже есть хорошая карточка: %d   "
+                  "к обработке: %d"
+                  % (len(parts), len(parts) - len(todo), len(todo)))
+            print("Осталось вызовов сегодня: %d" % client.remaining_today())
+            print("Прогноз:      %s"
+                  % plan_eta(len(todo), client.day_limit, client.rps))
             wanted = {p.upper(): p for p in parts}
             covered: Dict[str, Dict[str, Any]] = {}
             bonus: Dict[str, Dict[str, Any]] = {}
-            calls_before = 0
-            for i, part in enumerate(parts, 1):
+            attempted: set = set()
+            hit: set = set()
+            for i, part in enumerate(todo, 1):
                 if part.upper() in covered:      # серия уже накрыта соседом
                     continue
                 try:
@@ -756,6 +772,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 except BudgetExhausted as exc:
                     print("\nОстановлено: %s" % exc)
                     break
+                attempted.add(part.upper())
+                if found:
+                    hit.add(part.upper())
                 # Один вызов приносит всю серию: manuPartNum ищет по
                 # вхождению, поэтому в ответе лежат и соседние позиции.
                 for item in found:
@@ -764,10 +783,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         covered.setdefault(key, item)
                     else:
                         bonus.setdefault(key, item)
-                if args.verbose or i % 25 == 0 or i == len(parts):
+                if args.verbose or i % 25 == 0 or i == len(todo):
                     print("  %5d/%d  покрыто %d  с PDF %d  вызовов %d (кэш %d)"
                           "  деталей на вызов %.1f"
-                          % (i, len(parts), len(covered),
+                          % (i, len(todo), len(covered),
                              sum(1 for r in covered.values() if r.get("url")),
                              client.calls, client.cache_hits,
                              len(covered) / max(1, client.calls)), flush=True)
@@ -777,6 +796,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("  накрыто %d из %d парт-номеров, попутно собрано %d "
                   "позиций мимо списка"
                   % (len(covered), len(wanted), len(bonus)))
+            pending = [p for p in todo if p.upper() not in attempted]
+            misses = len(attempted - hit)
+            if misses:
+                print("  нет в каталоге element14: %d (повторять завтра смысла "
+                      "нет — кэш помнит и не тратит на них вызовы)" % misses)
+            if args.plan_out and pending:
+                args.plan_out.parent.mkdir(parents=True, exist_ok=True)
+                args.plan_out.write_text("\n".join(pending) + "\n",
+                                         encoding="utf-8")
+                print("  остаток на завтра: %s (%d парт-номеров) — %s"
+                      % (args.plan_out, len(pending),
+                         plan_eta(len(pending), client.day_limit, client.rps)))
+            elif pending:
+                print("  осталось необработанных: %d — %s"
+                      % (len(pending),
+                         plan_eta(len(pending), client.day_limit, client.rps)))
             if client.calls:
                 print("  деталей на вызов: %.1f (бюджет %d вызовов => до %d "
                       "деталей в сутки)"
@@ -812,6 +847,50 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("(--ignore-robots: ссылки на farnell.com/datasheets выданы самим API,")
         print(" мы пришли по нему, а не обходом сайта)")
     return 0
+
+
+def load_known_good(cards_db: Path, min_confidence: float = 0.0
+                    ) -> set:
+    """Парт-номера, у которых карточка уже хорошая.
+
+    Бюджет 50 000 вызовов в сутки слишком дорог, чтобы тратить его на то, что
+    у нас уже есть. Если по детали уже собрана карточка с производителем и
+    корпусом (и, если указано, с уверенностью не ниже порога), элемент14 для
+    неё не нужен: вызов уходит на деталь, которой ещё нет или которая
+    разобрана плохо.
+    """
+    if not cards_db or not cards_db.exists():
+        return set()
+    try:
+        con = sqlite3.connect(str(cards_db))
+        try:
+            rows = con.execute(
+                "SELECT part_key, manufacturer, package, confidence FROM cards"
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return set()
+    good = set()
+    for part_key, manufacturer, package, confidence in rows:
+        if not part_key:
+            continue
+        if not (manufacturer or "").strip() or not (package or "").strip():
+            continue
+        if min_confidence and (confidence or 0) < min_confidence:
+            continue
+        good.add(str(part_key).upper())
+    return good
+
+
+def plan_eta(pending: int, day_limit: int, rps: float) -> str:
+    """Сколько дней и сколько часов в день — считаем честно, по худшему."""
+    if pending <= 0:
+        return "всё покрыто"
+    days = max(1, -(-pending // max(1, day_limit)))      # ceil
+    hours = day_limit / max(0.1, rps) / 3600.0
+    return ("%d дн. по %d вызовов (около %.1f ч работы в день)"
+            % (days, day_limit, min(hours, 24.0)))
 
 
 def _load_state(path: Optional[Path]) -> Dict[str, Any]:
