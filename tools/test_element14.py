@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Tests for the element14 Product Search API client — without the API.
+
+Nothing here touches the network: the client takes an `opener` (or falls back
+to `element14._default_opener`, which the tests replace), so what is checked is
+the part that decides whether a 50 000-calls-a-day key survives a 300 000-part
+corpus: the request, the mapping, the cache, the rate limiter and the daily
+budget.
+
+    python3 tools/test_element14.py
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tools.rag import element14, fetch_datasheets  # noqa: E402
+
+PASS = FAIL = 0
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    global PASS, FAIL
+    if ok:
+        PASS += 1
+        print("[  ok  ]  %s" % name)
+    else:
+        FAIL += 1
+        print("[ FAIL ]  %s%s" % (name, (" — " + detail) if detail else ""))
+
+
+# --------------------------------------------------------------------------- #
+# поддельный транспорт
+# --------------------------------------------------------------------------- #
+
+class Fake:
+    """Records every request and answers from a script."""
+
+    def __init__(self, responses: List[Tuple[int, Any, Dict[str, str]]] = None):
+        self.urls: List[str] = []
+        self.bodies: List[Dict[str, str]] = []
+        self.script = list(responses or [])
+        self.default: Tuple[int, Any, Dict[str, str]] = (200, {"keywordSearchReturn":
+                                                              {"numberOfResults": 0,
+                                                               "products": []}}, {})
+
+    def __call__(self, url: str, timeout: float = 30.0):
+        self.urls.append(url)
+        status, body, headers = self.script.pop(0) if self.script else self.default
+        payload = body if isinstance(body, (bytes, str)) else json.dumps(body)
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        return status, payload, headers
+
+    def query(self, index: int = 0) -> Dict[str, str]:
+        """Разобранные параметры i-го запроса."""
+        import urllib.parse
+        pair = self.urls[index].split("?", 1)[1]
+        return dict(urllib.parse.parse_qsl(pair))
+
+
+def product(part: str, brand: str = "ONSEMI", sku: str = "1",
+            datasheet: str = "", attributes: List[dict] = None,
+            stock: int = 0) -> dict:
+    item = {
+        "sku": sku,
+        "displayName": "%s - %s - THING" % (brand, part),
+        "brandName": brand,
+        "translatedManufacturerPartNumber": part,
+        "stock": {"level": stock, "status": 1 if stock else 0},
+    }
+    if datasheet:
+        item["datasheets"] = [{"type": "T", "description": "Technical Data Sheet",
+                               "url": datasheet}]
+    if attributes is not None:
+        item["attributes"] = attributes
+    return item
+
+
+def payload(products: List[dict], total: int = None) -> dict:
+    return {"keywordSearchReturn": {
+        "numberOfResults": total if total is not None else len(products),
+        "products": products}}
+
+
+def client(fake: Fake, tmp: Path, **kwargs) -> element14.Element14:
+    params = {"api_key": "testkey000000000000000abc", "cache": tmp / "e14.sqlite3",
+              "rps": 1000.0, "opener": fake}
+    params.update(kwargs)
+    return element14.Element14(**params)
+
+
+def main() -> int:
+    tmp = Path(tempfile.mkdtemp(prefix="smd-e14-"))
+
+    print("--- запрос ---")
+    fake = Fake([(200, payload([product("MMBT3904", datasheet="https://x/a.pdf")]), {})])
+    e14 = client(fake, tmp)
+    row = e14.lookup("MMBT3904")
+    q = fake.query()
+    check("вызов идёт на api.element14.com/catalog/products",
+          fake.urls[0].startswith("https://api.element14.com/catalog/products?"),
+          fake.urls[0][:60])
+    check("ключ уезжает в callInfo.apiKey", q.get("callInfo.apiKey", "").startswith("testkey"),
+          str(q.get("callInfo.apiKey")))
+    check("витрина — в storeInfo.id", q.get("storeInfo.id") == element14.DEFAULT_STORE,
+          str(q.get("storeInfo.id")))
+    check("формат ответа — json", q.get("callInfo.responseDataFormat") == "json",
+          str(q.get("callInfo.responseDataFormat")))
+    check("парт-номер ищется по manuPartNum", q.get("term") == "manuPartNum:MMBT3904",
+          str(q.get("term")))
+    check("на вызов просят максимум товаров",
+          q.get("resultsSettings.numberOfResults") == str(element14.MAX_PER_PAGE),
+          str(q.get("resultsSettings.numberOfResults")))
+
+    print("\n--- разбор ответа ---")
+    check("парт-номер, производитель и ссылка на месте",
+          row["part"] == "MMBT3904" and row["manufacturer"] == "ONSEMI"
+          and row["url"] == "https://x/a.pdf", str(row))
+    attrs = [{"attributeLabel": " Operating Temperature Max", "attributeUnit": "°C",
+              "attributeValue": "150"},
+             {"attributeLabel": " Transistor Case Style", "attributeUnit": "",
+              "attributeValue": "SOT-23"},
+             {"attributeLabel": " пустой", "attributeUnit": "", "attributeValue": ""}]
+    row2 = e14.to_row(product("BC847", brand="NEXPERIA", datasheet="https://x/b.pdf",
+                             attributes=attrs, stock=42))
+    check("атрибуты собраны в «подпись -> значение с единицами»",
+          row2["attributes"].get("Operating Temperature Max") == "150 °C",
+          str(row2["attributes"]))
+    check("корпус взят из атрибута про case/package",
+          row2["package"] == "SOT-23", str(row2["package"]))
+    check("пустой атрибут не попал в словарь",
+          "пустой" not in row2["attributes"], str(list(row2["attributes"])))
+    check("склад сохранён", row2["stock"] == 42, str(row2["stock"]))
+    check("товар без datasheet даёт пустую ссылку",
+          e14.to_row(product("NOPDF"))["url"] == "")
+
+    print("\n--- выбор лучшего товара ---")
+    # manuPartNum ищет и по вхождению: MMBT3904 найдёт и MMBT3904LT1.
+    many = [product("MMBT3904LT1", sku="2", datasheet="https://x/lt1.pdf"),
+            product("MMBT3904", sku="1", datasheet="https://x/exact.pdf")]
+    fake2 = Fake([(200, payload(many), {})])
+    got = client(fake2, tmp / "b").lookup("MMBT3904")
+    check("точное совпадение парт-номера выигрывает",
+          got["part"] == "MMBT3904" and got["url"] == "https://x/exact.pdf", str(got))
+    fake3 = Fake([(200, payload([]), {})])
+    check("чего нет в каталоге — None, а не исключение",
+          client(fake3, tmp / "c").lookup("NOPE123") is None)
+
+    print("\n--- кэш: не платим дважды ---")
+    cache_dir = tmp / "cachecase"
+    fake4 = Fake([(200, payload([product("ABC123", datasheet="https://x/c.pdf")]), {}),
+                  (200, payload([product("ZZZ999", datasheet="https://x/z.pdf")]), {})])
+    e14 = client(fake4, cache_dir)
+    e14.lookup("ABC123")
+    check("первый раз — реальный вызов", e14.calls == 1, str(e14.calls))
+    again = client(fake4, cache_dir)
+    row_again = again.lookup("ABC123")
+    check("второй прогон берёт ответ из кэша",
+          again.calls == 0 and again.cache_hits == 1,
+          "%d вызовов, %d из кэша" % (again.calls, again.cache_hits))
+    check("из кэша приходит тот же парт-номер",
+          row_again["part"] == "ABC123", str(row_again))
+    check("пустой ответ тоже кэшируется (не долбим API по пустышкам)",
+          client(Fake([(200, payload([]), {})]), cache_dir).lookup("MISS1") is None
+          and client(Fake([]), cache_dir).lookup("MISS1") is None)
+
+    print("\n--- дневной бюджет 50 000 вызовов ---")
+    fake5 = Fake([(200, payload([product("P%d" % i, datasheet="https://x/%d.pdf" % i)]), {})
+                  for i in range(5)])
+    e14 = client(fake5, tmp / "budget", day_limit=2)
+    check("в начале дня бюджет цел", e14.remaining_today() == 2,
+          str(e14.remaining_today()))
+    e14.lookup("P0")
+    e14.lookup("P1")
+    check("после двух вызовов остаток — ноль", e14.remaining_today() == 0,
+          str(e14.remaining_today()))
+    raised = False
+    try:
+        e14.lookup("P2")
+    except element14.BudgetExhausted:
+        raised = True
+    check("третий вызов останавливается, а не долбит 403", raised)
+    check("истраченное не пропадает между прогонами",
+          client(fake5, tmp / "budget", day_limit=50000).remaining_today() == 49998,
+          str(client(fake5, tmp / "budget", day_limit=50000).remaining_today()))
+
+    print("\n--- квота от Mashery ---")
+    fake6 = Fake([(403, {"fault": "quota"}, {"X-Mashery-Error-Code":
+                                             "ERR_403_DEVELOPER_OVER_QPS"})
+                  for _ in range(4)])
+    e14 = client(fake6, tmp / "qps", retries=2)
+    got = e14.lookup("ANY")
+    check("превышение скорости не роняет прогон", got is None, str(got))
+    check("причина записана", any("квота" in e for e in e14.errors), str(e14.errors))
+
+    fake7 = Fake([(403, {"fault": "quota"}, {"X-Mashery-Error-Code":
+                                             "ERR_403_DEVELOPER_OVER_RATE"})])
+    e14 = client(fake7, tmp / "rate")
+    daily_stop = False
+    try:
+        e14.lookup("ANY")
+    except element14.BudgetExhausted:
+        daily_stop = True
+    check("дневной лимит распознаётся отдельно и останавливает прогон", daily_stop)
+    check("после него остаток обнуляется, чтобы не тратить вызовы впустую",
+          e14.remaining_today() == 0, str(e14.remaining_today()))
+
+    print("\n--- ограничитель скорости ---")
+    fake8 = Fake([(200, payload([]), {}) for _ in range(3)])
+    e14 = client(fake8, tmp / "rps", rps=2)
+    started = time.time()
+    for i in range(3):
+        e14.raw("any:x%d" % i, number=1)      # разный term: иначе сработает кэш
+    elapsed = time.time() - started
+    check("больше rps вызовов в секунду не уходит", elapsed >= 0.4,
+          "%.2f с на 3 вызова при rps=2" % elapsed)
+
+    print("\n--- постраничный проход ---")
+    page1 = payload([product("P%d" % i, datasheet="https://x/%d.pdf" % i)
+                     for i in range(3)], total=4)
+    page2 = payload([product("P2", datasheet="https://x/2.pdf"),
+                     product("P3", datasheet="https://x/3.pdf")], total=4)
+    fake9 = Fake([(200, page1, {}), (200, page2, {})])
+    e14 = client(fake9, tmp / "browse")
+    rows = e14.browse("any:thing", max_pages=5, per_page=3)
+    check("проход собирает товары со всех страниц", len(rows) == 4,
+          str([r["part"] for r in rows]))
+    check("дубли по парт-номеру отброшены",
+          len({r["part"] for r in rows}) == 4, str([r["part"] for r in rows]))
+    check("offset первой страницы — 0", fake9.query(0).get("resultsSettings.offset") == "0",
+          str(fake9.query(0).get("resultsSettings.offset")))
+    check("offset второй — на размер страницы",
+          fake9.query(1).get("resultsSettings.offset") == "3",
+          str(fake9.query(1).get("resultsSettings.offset")))
+    check("неполная страница останавливает проход",
+          len(client(Fake([(200, page2, {})]), tmp / "b2").browse(
+              "any:x", max_pages=5, per_page=3)) == 2)
+
+    print("\n--- список для загрузчика ---")
+    csv_path = tmp / "out" / "parts.csv"
+    rows = [e14.to_row(product("MMBT3904", datasheet="https://farnell.com/a.pdf",
+                              attributes=attrs)),
+            e14.to_row(product("NOPDF"))]
+    written = element14.write_csv(csv_path, rows)
+    check("в CSV попадают только строки со ссылкой", written == 1, str(written))
+    back = fetch_datasheets.read_list(csv_path)
+    check("загрузчик понимает этот файл",
+          back and back[0]["part"] == "MMBT3904"
+          and back[0]["url"] == "https://farnell.com/a.pdf", str(back[:1]))
+    check("производитель и корпус доезжают до загрузчика",
+          back[0]["manufacturer"] == "ONSEMI" and back[0]["package"] == "SOT-23",
+          str(back[0]))
+
+    attrs_path = tmp / "attrs.jsonl"
+    n = element14.write_attributes(attrs_path, rows)
+    check("атрибуты пишутся в JSONL", n == 1, str(n))
+    saved = json.loads(attrs_path.read_text(encoding="utf-8").splitlines()[0])
+    check("в JSONL есть и парт-номер, и атрибуты",
+          saved["part"] == "MMBT3904" and "Operating Temperature Max" in saved["attributes"],
+          str(saved))
+
+    parts_txt = tmp / "parts.txt"
+    parts_txt.write_text("MMBT3904\n# comment\n\nSI2301\n", encoding="utf-8")
+    check("txt-список читается, комментарии пропускаются",
+          element14.read_parts(parts_txt) == ["MMBT3904", "SI2301"],
+          str(element14.read_parts(parts_txt)))
+    check("--limit обрезает список",
+          element14.read_parts(parts_txt, limit=1) == ["MMBT3904"])
+
+    print("\n--- --check ---")
+    fake10 = Fake([(200, payload([product("MMBT3904", datasheet="https://x/a.pdf",
+                                         stock=900, attributes=attrs)]), {})])
+    import io as _io
+    import contextlib as _ctx
+    element14._default_opener = fake10
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        rc = element14.main(["--check", "--api-key", "testkey000000000000000abc",
+                             "--no-cache"])
+    text = buf.getvalue()
+    check("--check проходит", rc == 0, str(rc))
+    check("--check показывает ссылку на datasheet", "https://x/a.pdf" in text, text[:200])
+    check("--check показывает остаток вызовов", "Осталось сегодня" in text, text[:200])
+    check("--check показывает атрибуты", "150 °C" in text, text[-300:])
+
+    fake11 = Fake([(403, {"fault": "nope"}, {"X-Mashery-Error-Code":
+                                             "ERR_403_DEVELOPER_INACTIVE"})])
+    element14._default_opener = fake11
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        rc = element14.main(["--check", "--api-key", "testkey000000000000000abc",
+                             "--no-cache"])
+    check("нерабочий ключ объясняют, а не молчат",
+          rc == 1 and "partner.element14.com" in buf.getvalue(),
+          buf.getvalue()[:200])
+
+    print("\n--- прогон по списку парт-номеров ---")
+    parts_file = tmp / "list.txt"
+    parts_file.write_text("MMBT3904\nMISSING1\nSI2301\n", encoding="utf-8")
+    fake12 = Fake([
+        (200, payload([product("MMBT3904", datasheet="https://x/a.pdf")]), {}),
+        (200, payload([]), {}),
+        # SI2301: сначала без datasheet, потом точное совпадение со ссылкой
+        (200, payload([product("SI2301", datasheet="https://x/c.pdf")]), {}),
+    ])
+    element14._default_opener = fake12
+    out_csv = tmp / "run" / "parts.csv"
+    buf = _io.StringIO()
+    with _ctx.redirect_stdout(buf):
+        rc = element14.main(["--parts", str(parts_file), "--to-csv", str(out_csv),
+                             "--api-key", "testkey000000000000000abc",
+                             "--cache", str(tmp / "run-cache.sqlite3")])
+    text = buf.getvalue()
+    check("прогон завершается сам", rc == 0, str(rc))
+    check("воронка печатается: позиции / с PDF / с производителем",
+          "с datasheet-ссылкой: 2" in text and "с производителем:    2" in text,
+          text[-400:])
+    check("вызовы посчитаны", "вызовов API:         3" in text, text[-400:])
+    check("CSV записан", out_csv.exists() and len(fetch_datasheets.read_list(out_csv)) == 2,
+          str(out_csv.exists()))
+    check("команда для скачивания печатается целиком",
+          "fetch_datasheets.py --list" in text and "--ignore-robots" in text,
+          text[-300:])
+
+    print("\n--- без ключа ---")
+    no_key = False
+    try:
+        element14.Element14("")
+    except SystemExit as exc:
+        no_key = "SMD_E14_KEY" in str(exc) or "partner.element14.com" in str(exc)
+    check("нет ключа — понятное сообщение, а не трейс", no_key)
+
+    print("\n--- итог ---")
+    print("%d пройдено, %d провалено" % (PASS, FAIL))
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
