@@ -13,14 +13,17 @@ works, and that we can *see* the tables we do not know (audit_tables.py).
 from __future__ import annotations
 
 import io
+import json
 import shutil
+import sys
+import threading
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools.rag import audit_tables, extract, sample_datasheets  # noqa: E402
+from tools.rag import audit_tables, cli, extract, parsers, sample_datasheets  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -217,9 +220,111 @@ def main() -> int:
     check("пустая папка — понятное сообщение",
           audit_tables.main(["--corpus", str(empty)]) == 1)
 
-    shutil.rmtree(tmp, ignore_errors=True)
+    print("\n--- выживание после падения ---")
+    # 0xC00000FD убивает процесс без всякого except, поэтому единственный
+    # способ не терять 45 минут работы — писать результат после каждого файла.
+    snapshots = []
+    pdfs = sorted(corpus.rglob("*.pdf"))
+    audit_tables.audit(pdfs, top=5, progress=False,
+                       parser=parsers.get_parser("pdfplumber"),
+                       sink=snapshots.append)
+    check("snapshot пишется после каждого файла",
+          len(snapshots) == len(pdfs), "%d снимков на %d файлов"
+          % (len(snapshots), len(pdfs)))
+    check("в каждом снимке есть счётчик готовности",
+          all(s["files_done"] == i + 1 for i, s in enumerate(snapshots)),
+          str([s["files_done"] for s in snapshots]))
+    check("завершённый прогон помечен полным",
+          snapshots[-1]["files_done"] == snapshots[-1]["files_total"],
+          str(snapshots[-1]["files_done"]))
+    check("снимок можно записать в JSON в любой момент",
+          json.loads(json.dumps(snapshots[0], ensure_ascii=False))["tables"]
+          == snapshots[0]["tables"])
+
+    partial = dict(snapshots[1])
+    partial["files_done"] = 2
+    partial["files_total"] = 50
+    partial_text = "\n".join(audit_tables.report(partial, 5))
+    check("недоделанный аудит помечен предупреждением",
+          "прогoн".replace("o", "о") in partial_text and "2" in partial_text
+          and "50" in partial_text, partial_text.splitlines()[:2])
+
+    check("run_with_big_stack возвращает результат",
+          cli.run_with_big_stack(lambda a, b=0: a + b, 2, b=3) == 5)
+    box = {"deep": 0}
+
+    def boom():
+        raise ValueError("как будто torch лёг")
+
+    try:
+        cli.run_with_big_stack(boom)
+        check("run_with_big_stack пробрасывает исключение", False, "не упало")
+    except ValueError:
+        check("run_with_big_stack пробрасывает исключение", True)
+
+    # The point is the stack, not the Python recursion limit: Windows dies in
+    # torch's C++ recursion, which `sys.setrecursionlimit` does not govern.
+    # So check the mechanism — a separate thread — and that deep recursion
+    # survives once the Python-side limit is out of the way.
+    seen_thread = {}
+
+    def whoami():
+        seen_thread["id"] = threading.get_ident()
+        return 1
+
+    cli.run_with_big_stack(whoami)
+    check("код выполняется в отдельном потоке",
+          seen_thread.get("id") not in (None, threading.get_ident()),
+          str(seen_thread.get("id")))
+
+    def deep(n):
+        return deep(n + 1) if n < 20000 else n
+
+    old_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(40000)
+    try:
+        depth = cli.run_with_big_stack(deep, 0)
+        check("20 000 кадров помещаются в большой стек", depth == 20000,
+              str(depth))
+    except RecursionError:
+        check("20 000 кадров помещаются в большой стек", False, "RecursionError")
+    finally:
+        sys.setrecursionlimit(old_limit)
+
+    print("\n--- битый файл не роняет прогон ---")
+    broken = tmp / "broken"
+    broken.mkdir(exist_ok=True)
+    (broken / "bad.pdf").write_bytes(b"%PDF-1.4\nnot a pdf at all")
+    res = audit_tables.audit([broken / "bad.pdf"] + pdfs[:2], top=5,
+                             progress=False,
+                             parser=parsers.get_parser("pdfplumber"))
+    check("битый PDF попал в failures", len(res["failures"]) == 1,
+          str(res["failures"]))
+    check("остальные файлы всё равно разобраны", res["files_done"] == 3,
+          str(res["files_done"]))
+
+    print("\n--- бэкап перед --rebuild ---")
+    from tools.rag import build_cards
+
+    db_dir = tmp / "cardsdir"
+    db_dir.mkdir(exist_ok=True)
+    build_cards.build(corpus, db_dir, jobs=2, shards=False)
+    db = db_dir / "cards.db"
+    check("карточки собраны", build_cards._count_cards(db) > 0,
+          str(build_cards._count_cards(db)))
+    backup = build_cards._backup_before_rebuild(db)
+    check("бэкап сделан", backup is not None and backup.exists(), str(backup))
+    check("в бэкапе те же карточки",
+          backup is not None
+          and build_cards._count_cards(backup) == build_cards._count_cards(db),
+          "%s против %s" % (backup and build_cards._count_cards(backup),
+                            build_cards._count_cards(db)))
+    check("бэкап не перезаписал саму базу",
+          build_cards._count_cards(db) > 0 and not db.name.startswith("cards.db."))
+
     print("\n--- итог ---")
     print("%d пройдено, %d провалено" % (PASS, FAIL))
+    shutil.rmtree(tmp, ignore_errors=True)
     return 1 if FAIL else 0
 
 

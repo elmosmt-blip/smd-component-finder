@@ -150,6 +150,51 @@ def _fmt_eta(seconds: float) -> str:
     return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
 
 
+def _count_cards(db: Path) -> int:
+    """How many cards are in there — asked only to warn before deleting them."""
+    try:
+        con = sqlite3.connect(str(db))
+        try:
+            return int(con.execute("SELECT COUNT(*) FROM cards").fetchone()[0])
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return 0
+
+
+def _backup_before_rebuild(db: Path) -> Optional[Path]:
+    """Copy `cards.db` aside before `--rebuild` empties it.
+
+    `--rebuild` on a corpus smaller than the database is a one-command way to
+    lose everything: it deleted 14 459 cards to make room for a run that then
+    died halfway and produced 56. A backup costs a few seconds and turns that
+    from a disaster into an inconvenience, so it is not optional and not
+    behind a flag.
+
+    `Connection.backup` is used rather than `shutil.copy` because the web
+    server may hold the database open in WAL mode: copying the file alone
+    would leave the newest commits in `-wal` and restore a stale snapshot.
+    """
+    if not db.exists() or db.stat().st_size == 0:
+        return None
+    dest = db.with_name(db.name + time.strftime(".pre-rebuild-%Y%m%d-%H%M%S"))
+    src = sqlite3.connect(str(db))
+    dst = sqlite3.connect(str(dest))
+    try:
+        src.backup(dst)          # checkpoints the WAL into the copy
+        dst.close()
+    except sqlite3.Error as exc:
+        print("  Бэкап не удался: %s" % exc)
+        try:
+            dst.close()
+        except sqlite3.Error:
+            pass
+        return None
+    finally:
+        src.close()
+    return dest
+
+
 def build(corpus: Path, out: Path, parser_name: str = "auto", jobs: int = 0,
           limit: int = 0, shard: Optional[str] = None, rebuild: bool = False,
           shards: bool = True, verbose: bool = False,
@@ -177,6 +222,19 @@ def build(corpus: Path, out: Path, parser_name: str = "auto", jobs: int = 0,
         # database open, and a new inode (or a deleted -wal/-shm pair) would
         # leave it reading a snapshot that no longer exists.
         db = out / "cards.db"
+        existing = _count_cards(db) if db.exists() else 0
+        if existing:
+            print("Внимание: --rebuild удалит %s карточек из %s"
+                  % ("{:,}".format(existing).replace(",", " "), db.name))
+            if len(pdfs) < existing:
+                print("  В корпусе %d PDF — база станет сильно меньше, чем "
+                      "была. Если это не то, что нужно, снимите --rebuild и "
+                      "запуститесь в другую папку (--out)." % len(pdfs))
+            backup = _backup_before_rebuild(db)
+            if backup:
+                print("  Бэкап: %s (%.1f МБ) — вернуть: скопировать поверх %s"
+                      % (backup.name, backup.stat().st_size / 1e6, db.name))
+            print("")
         if db.exists():
             con = sqlite3.connect(str(db))
             try:

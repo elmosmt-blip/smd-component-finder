@@ -39,9 +39,18 @@ git log --oneline -1
 npm test
 ```
 
-Ожидается: **393 + 73 = 466 проверок, 0 провалов**
-(было 316: test_fetch 96, test_rag 48, test_tables 53, test_docling 41,
-test_cards 40, test_quality 49, test_ingest 23, test_opensearch 43, npm 73).
+Ожидается: **552 + 75 = 627 проверок, 0 провалов**
+(test_fetch 96, test_rag 48, test_tables 68, test_docling 41, test_cards 40,
+test_quality 49, test_ingest 23, test_opensearch 43, test_element14 82,
+test_card_index 30, test_enrich 32 — итого 552; npm 75 = matcher 30 + ui 45).
+
+Сюиты element14, card_index и enrich — новые, добавь их в прогон:
+
+```powershell
+.\.venv\Scripts\python tools\test_element14.py
+.\.venv\Scripts\python tools\test_card_index.py
+.\.venv\Scripts\python tools\test_enrich.py
+```
 
 **Ничего не удаляй.** `cards.db.bak2_*`, `C:\smd-corpus\pdf`, `scans`,
 `good`, `parsed` — всё остаётся на месте.
@@ -108,20 +117,44 @@ Docling и сколько pdfplumber. Пришли его: если на `--pars
 .\.venv\Scripts\pip install easyocr       # либо установи tesseract и добавь в PATH
 ```
 
-Затем:
+**Стоп. Прошлый прогон D3 именно так и был запущен — и потерял 14 459
+карточек.** `--rebuild` очистил базу, Docling за 50 минут дал 56 карточек,
+прогон умер, база осталась почти пустой. Два правила, теперь они в коде:
+
+1. **Никогда не `--rebuild` в основную базу.** Собирай сканы в отдельный
+   `--out`, а потом вливай. Теперь `build_cards.py` перед `--rebuild` сам
+   делает бэкап `cards.db.pre-rebuild-<время>` и предупреждает, если в корпусе
+   PDF меньше, чем карточек в базе, — но рассчитывать на бэкап вместо
+   правильного `--out` не надо.
+2. **Сначала замерь на 20 файлах, потом считай на 854.** У нас уже есть
+   число: **56 карточек за 50 минут на 8 воркерах**, то есть ~1.1 карточки в
+   минуту. 854 скана — это **около 13 часов**, а не «прогон на вечер». easyocr
+   тянет за собой torch и тратит время на инициализацию в каждом воркере.
+
+Поэтому сначала:
+
+```powershell
+.\.venv\Scripts\python tools\rag\build_cards.py --corpus C:\smd-corpus\scans ^
+    --parser docling --jobs 8 --limit 20 --out C:\smd-corpus\cards-scans --no-shards
+```
+
+Посмотри на «время на файл» и прикинь полный прогон, прежде чем запускать его
+на ночь. Если выходит больше 6–8 часов — не запускай на всё сразу: ночной
+прогон, который не доезжает, ничего не даёт.
+
+Затем, если время приемлемо (и только тогда):
 
 ```powershell
 set SMD_DOCLING_OCR=auto
 .\.venv\Scripts\python tools\rag\build_cards.py --corpus C:\smd-corpus\scans ^
-    --parser docling --jobs 8 --rebuild --no-shards
+    --parser docling --jobs 8 --out C:\smd-corpus\cards-scans --no-shards
 ```
 
 `auto` = OCR включается только там, где нет текстового слоя. Обычные PDF
 ничего за это не платят.
 
-Пришли блок **«Чем разобрано»** и, если Docling отказал, строки `! ...`
-(причина печатается один раз, а не 854). А также: сколько заняло время на
-831 файл.
+Пришли блок **«Чем разобрано»**, время на файл и, если Docling отказал,
+строки `! ...` (причина печатается один раз, а не 854).
 
 ---
 
@@ -158,12 +191,53 @@ set SMD_DOCLING_OCR=auto
 ## Шаг D5. Аудит таблиц новым словарём
 
 ```powershell
-.\.venv\Scripts\python tools\rag\audit_tables.py --corpus C:\smd-corpus\pdf --limit 50 --json audit2.json
+.\.venv\Scripts\python tools\rag\audit_tables.py --corpus C:\smd-corpus\pdf --limit 50 ^
+    --parser pdfplumber --json audit2.json
 ```
 
-Теперь: регистры МК считаются отдельной строкой «распознано и отброшено»,
-строка «НЕ распознано» показывает **полное** число таблиц, а не сумму по
-топ-25. Пришли весь вывод — по нему дополню словарь.
+**`--parser pdfplumber` обязателен.** В прошлый раз аудит упал через 45 минут
+с кодом `-1073741571` = `0xC00000FD` (STATUS_STACK_OVERFLOW): Docling тянет
+torch, а table-transformer рекурсирует глубже, чем 1 МБ стека, который
+Windows даёт python.exe. Такое падение не ловится никаким `except` — процесс
+умирает сразу, и 45 минут работы пропали.
+
+Что изменилось в коде:
+
+* `--json` теперь **перезаписывается после каждого файла**, поэтому падение на
+  41-м файле из 50 оставляет на диске ответ по 41 файлу;
+* разбор идёт в потоке с большим стеком (256 МБ) — это лечит сам
+  STATUS_STACK_OVERFLOW;
+* `--parser pdfplumber` позволяет вообще не звать torch. Классификация таблиц
+  от парсера не зависит: вопрос «какие заголовки мы не узнаём» — к
+  `extract.classify_table`, и pdfplumber отвечает на него так же.
+
+Незавершённый `audit2.json` печатается с предупреждением «прогон прерван,
+обработано N из M» — не выдавай его за полный.
+
+Регистры МК считаются отдельной строкой «распознано и отброшено», строка «НЕ
+распознано» показывает **полное** число таблиц, а не сумму по топ-25. Пришли
+весь вывод — по нему дополню словарь.
+
+---
+
+## Шаг D6. Обогащение карточек атрибутами element14
+
+После D4 у тебя есть `parts2.csv` на 50 000 деталей. По нему можно собрать
+атрибуты каталога и влить в карточки — это закрывает производителя и корпус
+там, где парсер их не нашёл:
+
+```powershell
+.\.venv\Scripts\python tools\rag\element14.py --parts parts2.csv --store uk.farnell.com ^
+    --api-key ТВОЙ_КЛЮЧ --attributes-out attrs.jsonl --skip-good data\cards\cards.db
+
+.\.venv\Scripts\python tools\rag\pipeline.py --enrich attrs.jsonl ^
+    --from-cards data\cards\cards.db --out data\rag --rebuild
+```
+
+Правила обогащения (они же проверяются тестами): заполняются только пустые
+поля, остальное идёт в отдельный блок `extra_specs` с пометкой источника,
+`confidence` не растёт. Замер на 13 даташитах: производитель 84.6 % → 100 %,
+корпус 69.2 % → 100 %.
 
 ---
 
@@ -174,7 +248,9 @@ set SMD_DOCLING_OCR=auto
   ловили);
 * не используй `--basic-only` на этом кэше;
 * не качай с `lcsc.com` и агрегаторов — только `wmsc.lcsc.com` и сайты
-  производителей.
+  производителей;
+* не запускай `--rebuild` на `data\cards\cards.db` — собирай новую порцию в
+  отдельный `--out` (см. шаг D3).
 
 ---
 

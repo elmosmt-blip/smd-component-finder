@@ -12,9 +12,16 @@ came back as "unknown".
 
     python3 tools/rag/audit_tables.py --corpus data/datasheets --limit 50
     python3 tools/rag/audit_tables.py --corpus data/datasheets --top 40 --json t.json
+    python3 tools/rag/audit_tables.py --corpus C:\smd-corpus\scans --parser pdfplumber
 
 The output is meant to be pasted into a chat: frequencies first, then a few
 full examples. Nothing here writes to the database.
+
+`--json` is rewritten after every file, on purpose. A 50-file audit takes tens
+of minutes, and on Windows it can end in STATUS_STACK_OVERFLOW — a crash that
+no `except` catches, so neither `finally` nor Ctrl-C handling would save the
+result. Writing as we go means a crash at file 41 still leaves 41 files of
+answer on disk instead of a 45-minute hole.
 """
 
 from __future__ import annotations
@@ -26,7 +33,7 @@ import random
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -68,9 +75,16 @@ def _first_row(table: List[List[str]], cell: int = 16) -> str:
 
 
 def audit(pdf_paths: List[Path], top: int = 25, examples: int = 3,
-          progress: bool = True) -> Dict[str, Any]:
-    """Parse every file, classify every table, count what came out."""
-    parser = parsers.get_parser("auto")
+          progress: bool = True, parser=None,
+          sink: Optional[Callable[[Dict[str, Any]], None]] = None
+          ) -> Dict[str, Any]:
+    """Parse every file, classify every table, count what came out.
+
+    `sink` is called with a snapshot of the result after every file, so the
+    caller can persist it. That is what makes a crash survivable: the numbers
+    from the files that did get parsed are already on disk.
+    """
+    parser = parser or parsers.get_parser("auto")
     kinds: Counter = Counter()
     unknown: Counter = Counter()
     unknown_examples: Dict[str, List[str]] = {}
@@ -80,14 +94,47 @@ def audit(pdf_paths: List[Path], top: int = 25, examples: int = 3,
     docs_without_tables = 0
     tables_total = 0
     failures: List[str] = []
+    done = [0]
+
+    def snapshot() -> Dict[str, Any]:
+        return {
+            # How far the run got, so a partial file is never mistaken for a
+            # complete one — the whole point of writing as we go.
+            "files_total": len(pdf_paths),
+            "files_done": done[0],
+            "docs": docs,
+            "docs_without_tables": docs_without_tables,
+            "tables": tables_total,
+            "kinds": dict(kinds),
+            # Recognised on purpose and then dropped: register maps and the
+            # like. Not a failure: counting them as "распознано" would flatter
+            # the number, counting them as "не распознано" would hide the fix.
+            "ignored": sum(n for k, n in kinds.items() if k in extract.IGNORED_KINDS),
+            "recognised": sum(n for k, n in kinds.items()
+                              if k not in extract.IGNORED_KINDS),
+            # `unknown` is truncated to `--top` for printing; the total is not.
+            "unknown_total": sum(unknown.values()),
+            "unknown": unknown.most_common(top),
+            "unknown_examples": unknown_examples,
+            "pin_shaped_caught": pin_shaped_caught,
+            "pin_shaped_headers": pin_shaped,
+            "failures": failures,
+        }
 
     for i, path in enumerate(pdf_paths, 1):
         if progress and (i % 10 == 0 or i == len(pdf_paths)):
             print("  %d/%d файлов…" % (i, len(pdf_paths)), flush=True)
         try:
-            doc = parser.parse(path)
+            # Torch's table-transformer recurses deep enough to exhaust the
+            # 1 MB stack Windows gives python.exe; the process then dies with
+            # 0xC00000FD and no `except` in the world can catch it. A thread
+            # with a big stack is the only thing that survives.
+            doc = cli.run_with_big_stack(parser.parse, path)
         except Exception as exc:                   # noqa: BLE001 - a broken PDF is data
             failures.append("%s: %s" % (path.name, type(exc).__name__))
+            done[0] = i
+            if sink:
+                sink(snapshot())
             continue
         docs += 1
         tables_here = 0
@@ -115,29 +162,25 @@ def audit(pdf_paths: List[Path], top: int = 25, examples: int = 3,
         if not tables_here:
             docs_without_tables += 1
 
-    return {
-        "docs": docs,
-        "docs_without_tables": docs_without_tables,
-        "tables": tables_total,
-        "kinds": dict(kinds),
-        # Recognised on purpose and then dropped: register maps and the like.
-        # They are not failures — counting them as "распознано" would flatter
-        # the number, counting them as "не распознано" would hide the fix.
-        "ignored": sum(n for k, n in kinds.items() if k in extract.IGNORED_KINDS),
-        "recognised": sum(n for k, n in kinds.items() if k not in extract.IGNORED_KINDS),
-        # `unknown` is truncated to `--top` for printing; the total is not.
-        "unknown_total": sum(unknown.values()),
-        "unknown": unknown.most_common(top),
-        "unknown_examples": unknown_examples,
-        "pin_shaped_caught": pin_shaped_caught,
-        "pin_shaped_headers": pin_shaped,
-        "failures": failures,
-    }
+        done[0] = i
+        if sink:
+            sink(snapshot())
+
+    return snapshot()
 
 
 def report(result: Dict[str, Any], top: int) -> List[str]:
     lines: List[str] = []
     tables = result["tables"]
+
+    # A partial run must say so in the first line, otherwise forty minutes of
+    # work read like a complete answer to a question it only half answered.
+    done = result.get("files_done")
+    total = result.get("files_total")
+    if done is not None and total and done < total:
+        lines.append("ВНИМАНИЕ: прогон прерван, обработано %d файлов из %d. "
+                     "Цифры ниже — по тем, что успели." % (done, total))
+        lines.append("")
     recognised = result["recognised"]
     pct = (100.0 * recognised / tables) if tables else 0.0
 
@@ -202,7 +245,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="сколько PDF разобрать (выборка случайная)")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--top", type=int, default=25, help="сколько заголовков показать")
-    ap.add_argument("--json", type=Path, default=None, help="выгрузить всё в JSON")
+    ap.add_argument("--json", type=Path, default=None,
+                    help="выгружать всё в JSON — файл перезаписывается после "
+                         "каждого PDF, чтобы падение не съело результат")
+    ap.add_argument("--parser", default="auto",
+                    help="auto | pdfplumber | docling. Если Docling падает "
+                         "(0xC00000FD на Windows — переполнение стека в torch), "
+                         "ставьте pdfplumber: классификация таблиц от парсера "
+                         "не зависит")
+    ap.add_argument("--flush-every", type=int, default=1,
+                    help="писать JSON каждые N файлов (по умолчанию после "
+                         "каждого — на медленном диске поставьте 5)")
     args = ap.parse_args(argv)
 
     corpus = Path(args.corpus)
@@ -220,20 +273,60 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         print("Разбираю %d файлов из %s" % (len(pdfs), corpus))
 
-    result = audit(pdfs, top=args.top)
+    def write_json(result: Dict[str, Any]) -> None:
+        if not args.json:
+            return
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        tmp = args.json.with_suffix(args.json.suffix + ".tmp")
+        tmp.write_text(json.dumps(result, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        os.replace(str(tmp), str(args.json))
+
+    try:
+        parser = parsers.get_parser(args.parser)
+    except parsers.ParserUnavailable as exc:
+        print("Парсер %s недоступен: %s" % (args.parser, exc))
+        return 1
+    print("Парсер: %s" % parser.name)
+
+    seen = [0]
+
+    def sink(result: Dict[str, Any]) -> None:
+        seen[0] += 1
+        if args.flush_every <= 1 or seen[0] % args.flush_every == 0:
+            write_json(result)
+
+    result: Dict[str, Any] = {}
+    try:
+        result = audit(pdfs, top=args.top, parser=parser, sink=sink)
+    except KeyboardInterrupt:
+        print("")
+        print("Прервано (Ctrl-C) — вывожу то, что успело набраться.")
+        result = {}
+
     print("")
     print("=" * 72)
     print("Аудит таблиц — %s" % corpus)
     print("=" * 72)
-    for line in report(result, args.top):
-        print(line)
-
-    if args.json:
-        args.json.parent.mkdir(parents=True, exist_ok=True)
-        args.json.write_text(json.dumps(result, ensure_ascii=False, indent=1),
-                             encoding="utf-8")
+    if result:
+        for line in report(result, args.top):
+            print(line)
+        if args.json:
+            write_json(result)
+            print("")
+            print("Полные данные: %s" % args.json)
+    elif args.json and args.json.exists():
         print("")
-        print("Полные данные: %s" % args.json)
+        print("Прогон не завершился. Данные по обработанным файлам — в %s:"
+              % args.json)
+        try:
+            partial = json.loads(args.json.read_text(encoding="utf-8"))
+            for line in report(partial, args.top):
+                print(line)
+        except (ValueError, KeyError) as exc:
+            print("  (прочитать не удалось: %s)" % exc)
+    else:
+        print("Ни одного файла не обработано, данных нет.")
 
     print("")
     print("Этот вывод можно целиком вставить в чат — по нему дополню словарь заголовков.")
