@@ -17,3 +17,12 @@ data/datasheets/uploaded/
 __pycache__/
 *.pyc
 .venv/
+
+# Локальные базы и кэш каталога: cards.db ~90 МБ, cache.sqlite3 ~6 ГБ.
+# `git add -A` на машине с корпусом не должен пытаться их закоммитить.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.sqlite3-journal
+*.csv
